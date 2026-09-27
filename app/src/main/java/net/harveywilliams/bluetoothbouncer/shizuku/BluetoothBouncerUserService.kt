@@ -9,7 +9,9 @@ import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import net.harveywilliams.bluetoothbouncer.IBluetoothBouncerUserService
 import java.util.concurrent.CompletableFuture
@@ -19,8 +21,21 @@ import java.util.concurrent.TimeUnit
  * Shizuku UserService — runs as shell UID (which holds BLUETOOTH_PRIVILEGED).
  * Instantiated by Shizuku in a separate process. Uses reflection to get context
  * and to call the hidden setConnectionPolicy method on each profile proxy.
+ *
+ * The constructor must never throw: if it does, Shizuku never hands the binder back to the
+ * app, which then waits at "Connecting…" forever with no way to tell why. All Bluetooth setup
+ * is therefore wrapped to catch [Throwable]; a failed setup is retried on the next call and
+ * shows up as a per-call failure (and in logcat) instead.
  */
-class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
+class BluetoothBouncerUserService() : IBluetoothBouncerUserService.Stub() {
+
+    /** Context Shizuku passes in (API 13+), used only if the reflective lookups fail. */
+    @Volatile private var providedContext: Context? = null
+
+    /** Shizuku prefers this constructor when present. */
+    constructor(context: Context) : this() {
+        providedContext = context
+    }
 
     // Mutable so reinitializeIfNeeded() can replace dead futures and retry.
     @Volatile private var bluetoothAdapter: BluetoothAdapter? = null
@@ -30,18 +45,30 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
     @Volatile private var hidFuture = CompletableFuture<Any?>()
 
     init {
-        val ctx = getAppContext()
-        bluetoothAdapter = resolveBluetoothAdapter(ctx)
+        Log.i(TAG, "UserService created (uid=${Process.myUid()}, sdk=${Build.VERSION.SDK_INT})")
+        try {
+            val ctx = getAppContext()
+            bluetoothAdapter = resolveBluetoothAdapter(ctx)
 
-        if (ctx == null || bluetoothAdapter == null) {
-            Log.w(TAG, "No context or adapter at init — will retry on first call")
-            // Complete futures with null so any early callers don't block forever.
-            a2dpFuture.complete(null)
-            headsetFuture.complete(null)
-            hidFuture.complete(null)
-        } else {
-            initProxies(ctx, bluetoothAdapter!!)
+            if (ctx == null || bluetoothAdapter == null) {
+                Log.w(TAG, "No context or adapter at init — will retry on first call")
+                bluetoothAdapter = null
+                // Complete futures with null so any early callers don't block forever.
+                completeFuturesWithNull()
+            } else {
+                initProxies(ctx, bluetoothAdapter!!)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Bluetooth setup failed at init — will retry on first call", t)
+            bluetoothAdapter = null
+            completeFuturesWithNull()
         }
+    }
+
+    private fun completeFuturesWithNull() {
+        a2dpFuture.complete(null)
+        headsetFuture.complete(null)
+        hidFuture.complete(null)
     }
 
     /**
@@ -53,46 +80,64 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
     private fun reinitializeIfNeeded() {
         if (bluetoothAdapter != null) return
 
-        Log.d(TAG, "Retrying initialization on first setConnectionPolicy call")
-        val ctx = getAppContext() ?: run {
-            Log.e(TAG, "Still no context after retry — blocking will not work")
-            return
-        }
-        val adapter = resolveBluetoothAdapter(ctx) ?: run {
-            Log.e(TAG, "Still no BluetoothAdapter after retry")
-            return
-        }
+        Log.d(TAG, "Retrying initialization on first call")
+        try {
+            val ctx = getAppContext() ?: providedContext ?: run {
+                Log.e(TAG, "Still no context after retry — blocking will not work")
+                return
+            }
+            val adapter = resolveBluetoothAdapter(ctx) ?: run {
+                Log.e(TAG, "Still no BluetoothAdapter after retry")
+                return
+            }
 
-        bluetoothAdapter = adapter
-        // Replace futures (the old ones are already completed with null).
-        a2dpFuture = CompletableFuture()
-        headsetFuture = CompletableFuture()
-        hidFuture = CompletableFuture()
-        initProxies(ctx, adapter)
+            bluetoothAdapter = adapter
+            // Replace futures (the old ones are already completed with null).
+            a2dpFuture = CompletableFuture()
+            headsetFuture = CompletableFuture()
+            hidFuture = CompletableFuture()
+            initProxies(ctx, adapter)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Bluetooth setup retry failed", t)
+            bluetoothAdapter = null
+            completeFuturesWithNull()
+        }
     }
 
     private fun initProxies(ctx: Context, adapter: BluetoothAdapter) {
-        adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                a2dpFuture.complete(proxy as? BluetoothA2dp)
-            }
-            override fun onServiceDisconnected(profile: Int) {}
-        }, BluetoothProfile.A2DP)
-
-        adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                headsetFuture.complete(proxy as? BluetoothHeadset)
-            }
-            override fun onServiceDisconnected(profile: Int) {}
-        }, BluetoothProfile.HEADSET)
-
+        requestProxy(ctx, adapter, BluetoothProfile.A2DP, "A2DP") { a2dpFuture.complete(it as? BluetoothA2dp) }
+        requestProxy(ctx, adapter, BluetoothProfile.HEADSET, "Headset") { headsetFuture.complete(it as? BluetoothHeadset) }
         // HID Host — BluetoothProfile.HID_HOST = 4 (constant not in compile-time SDK; use literal)
-        adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                hidFuture.complete(proxy)
+        requestProxy(ctx, adapter, 4 /* HID_HOST */, "HID") { hidFuture.complete(it) }
+    }
+
+    /**
+     * Requests one profile proxy. [onProxy] receives the proxy, or null if the request itself
+     * failed — so a failure on one profile never takes the others (or the service) down.
+     */
+    private fun requestProxy(
+        ctx: Context,
+        adapter: BluetoothAdapter,
+        profile: Int,
+        name: String,
+        onProxy: (BluetoothProfile?) -> Unit,
+    ) {
+        try {
+            val requested = adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    Log.d(TAG, "$name proxy connected")
+                    onProxy(proxy)
+                }
+                override fun onServiceDisconnected(profile: Int) {}
+            }, profile)
+            if (!requested) {
+                Log.w(TAG, "getProfileProxy($name) returned false")
+                onProxy(null)
             }
-            override fun onServiceDisconnected(profile: Int) {}
-        }, 4 /* HID_HOST */)
+        } catch (t: Throwable) {
+            Log.e(TAG, "getProfileProxy($name) failed", t)
+            onProxy(null)
+        }
     }
 
     // ── AIDL implementations ──────────────────────────────────────────────────
@@ -221,19 +266,27 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
         @SuppressLint("PrivateApi")
         private fun resolveBluetoothAdapter(ctx: Context?): BluetoothAdapter? {
             // Strategy 1: normal system service lookup
-            ctx?.let {
-                val adapter = (it.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-                if (adapter != null) {
-                    Log.d(TAG, "BluetoothAdapter via getSystemService()")
-                    return adapter
+            try {
+                ctx?.let {
+                    val adapter = (it.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+                    if (adapter != null) {
+                        Log.d(TAG, "BluetoothAdapter via getSystemService()")
+                        return adapter
+                    }
                 }
+            } catch (t: Throwable) {
+                Log.w(TAG, "getSystemService(BLUETOOTH_SERVICE) failed: $t")
             }
 
             // Strategy 2: deprecated static getter (still works on some API 31+ paths)
-            @Suppress("DEPRECATION")
-            BluetoothAdapter.getDefaultAdapter()?.let {
-                Log.d(TAG, "BluetoothAdapter via getDefaultAdapter()")
-                return it
+            try {
+                @Suppress("DEPRECATION")
+                BluetoothAdapter.getDefaultAdapter()?.let {
+                    Log.d(TAG, "BluetoothAdapter via getDefaultAdapter()")
+                    return it
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "getDefaultAdapter() failed: $t")
             }
 
             // Strategy 3: get bluetooth_manager binder via ServiceManager, then construct adapter directly.
@@ -289,12 +342,12 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
                         .also { it.isAccessible = true }
                         .set(null, adapter)
                     Log.d(TAG, "Set BluetoothAdapter.sAdapter")
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.w(TAG, "Could not set sAdapter — getProfileProxy may still fail: ${e.message}")
                 }
 
                 adapter
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "BluetoothAdapter via ServiceManager failed: ${e.message}", e)
                 null
             }
@@ -320,7 +373,7 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
                     Log.d(TAG, "Got context via currentApplication()")
                     return app
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "currentApplication() failed: ${e.message}")
             }
 
@@ -339,7 +392,7 @@ class BluetoothBouncerUserService : IBluetoothBouncerUserService.Stub() {
                         return ctx
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "getSystemContext() failed: ${e.message}")
             }
 

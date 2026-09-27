@@ -213,6 +213,62 @@ class ShizukuHelper(private val context: Context) {
         bindUserService()
     }
 
+    /**
+     * Builds a plain-text diagnostics report: app/device/Shizuku facts plus the recent system log
+     * lines about Bluetooth Bouncer and Shizuku. The log is read through a Shizuku shell process,
+     * so it includes the UserService's own process — the only place a startup crash of that
+     * service is visible. Works while the state is [State.Connecting]; without Shizuku it
+     * returns the facts only.
+     */
+    suspend fun collectDiagnostics(): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        sb.appendLine("Bluetooth Bouncer diagnostics")
+        sb.appendLine("App: ${context.packageName} ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+        sb.appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+        sb.appendLine("State: ${_state.value.javaClass.simpleName}, failed bind attempts: $failedBindAttempts, bind in flight: ${bindStartedAt != 0L}")
+        _bindProblem.value?.let { sb.appendLine("Bind problem: $it") }
+        try {
+            sb.appendLine("Shizuku: running=${isShizukuRunning()}, version=${Shizuku.getVersion()}, uid=${Shizuku.getUid()}, permission=${hasPermission()}")
+        } catch (e: Exception) {
+            sb.appendLine("Shizuku: unavailable ($e)")
+        }
+        sb.appendLine()
+        sb.appendLine("── Log ──")
+        try {
+            val lines = readSystemLogViaShizuku()
+            val relevant = lines.filter { line -> LOG_KEYWORDS.any { line.contains(it, ignoreCase = true) } }
+            relevant.takeLast(MAX_DIAGNOSTIC_LOG_LINES).forEach { sb.appendLine(it) }
+            if (relevant.isEmpty()) sb.appendLine("(no matching lines in the last ${lines.size} log lines)")
+        } catch (e: Exception) {
+            sb.appendLine("Couldn't read the system log: $e")
+        }
+        sb.toString()
+    }
+
+    /**
+     * Runs `logcat -d` as the Shizuku (shell) user. `Shizuku.newProcess` is private in API 13
+     * but still present, so it's called reflectively — this is a diagnostics-only path.
+     */
+    private fun readSystemLogViaShizuku(): List<String> {
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java,
+        ).apply { isAccessible = true }
+        val process = method.invoke(
+            null,
+            arrayOf("logcat", "-d", "-v", "time", "-t", "3000"),
+            null,
+            null,
+        ) as java.lang.Process
+        return try {
+            process.inputStream.bufferedReader().readLines()
+        } finally {
+            process.destroy()
+        }
+    }
+
     /** Stop the polling started by [startMonitoring]. */
     fun stopMonitoring() {
         monitorJob?.cancel()
@@ -428,6 +484,13 @@ class ShizukuHelper(private val context: Context) {
 
         /** How long a bind may take before it's treated as stuck and retried from scratch. */
         private const val BIND_RETRY_MS = 12_000L
+
+        /** Log lines containing any of these make it into [collectDiagnostics]. */
+        private val LOG_KEYWORDS = listOf(
+            "bluetoothbouncer", "BBUserService", "ShizukuHelper", "PolicyEnforcer",
+            "Shizuku", "UserService", "user_service", "AndroidRuntime", "FATAL",
+        )
+        private const val MAX_DIAGNOSTIC_LOG_LINES = 300
 
         /** How often [startMonitoring] re-checks Shizuku state while not Ready. */
         private const val MONITOR_INTERVAL_MS = 1_000L

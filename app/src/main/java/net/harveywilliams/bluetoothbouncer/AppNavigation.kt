@@ -67,6 +67,7 @@ fun AppNavigation(
                 bindProblem = shizukuBindProblem,
                 onRequestPermission = { app.shizukuHelper.requestPermission() },
                 onRetryConnect = { app.shizukuHelper.restartUserService() },
+                onCollectDiagnostics = { app.shizukuHelper.collectDiagnostics() },
                 onNavigateToDeviceList = {
                     navController.popBackStack(Routes.DEVICE_LIST, inclusive = false)
                 },

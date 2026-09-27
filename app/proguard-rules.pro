@@ -11,3 +11,6 @@
 
 # Keep Room entities
 -keep class net.harveywilliams.bluetoothbouncer.data.** { *; }
+
+# Diagnostics: ShizukuHelper reads the system log via the private Shizuku.newProcess
+-keepclassmembers class rikka.shizuku.Shizuku { private static rikka.shizuku.ShizukuRemoteProcess newProcess(java.lang.String[], java.lang.String[], java.lang.String); }

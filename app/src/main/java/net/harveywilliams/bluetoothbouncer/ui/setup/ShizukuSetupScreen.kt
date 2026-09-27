@@ -1,5 +1,7 @@
 package net.harveywilliams.bluetoothbouncer.ui.setup
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -31,7 +33,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -51,9 +58,13 @@ fun ShizukuSetupScreen(
     /** Returns false if Shizuku won't show its prompt, so the user must grant it in Shizuku. */
     onRequestPermission: () -> Boolean,
     onRetryConnect: () -> Unit,
+    /** Builds a diagnostics report (see [ShizukuHelper.collectDiagnostics]). */
+    onCollectDiagnostics: suspend () -> String,
     onNavigateToDeviceList: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var collectingDiagnostics by remember { mutableStateOf(false) }
     val shizukuLaunchIntent = remember(shizukuState) {
         context.packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
     }
@@ -189,6 +200,26 @@ fun ShizukuSetupScreen(
                 }
             }
 
+            // ── Diagnostics (for bug reports) ────────────────────────────────
+            if (shizukuState !is ShizukuHelper.State.Ready && shizukuState !is ShizukuHelper.State.NotInstalled) {
+                OutlinedButton(
+                    onClick = {
+                        collectingDiagnostics = true
+                        scope.launch {
+                            try {
+                                shareDiagnostics(context, onCollectDiagnostics())
+                            } finally {
+                                collectingDiagnostics = false
+                            }
+                        }
+                    },
+                    enabled = !collectingDiagnostics,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (collectingDiagnostics) "Collecting…" else "Copy diagnostics")
+                }
+            }
+
             // ── Setup instructions ───────────────────────────────────────────
             if (shizukuState !is ShizukuHelper.State.Ready) {
                 SetupInstructionsCard()
@@ -207,6 +238,23 @@ private fun openShizuku(context: Context, launchIntent: Intent?) {
         context.startActivity(launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     } catch (e: Exception) {
         Toast.makeText(context, "Couldn't open Shizuku", Toast.LENGTH_SHORT).show()
+    }
+}
+
+/** Copies the report to the clipboard and offers the share sheet. */
+private fun shareDiagnostics(context: Context, report: String) {
+    context.getSystemService(ClipboardManager::class.java)
+        ?.setPrimaryClip(ClipData.newPlainText("Bluetooth Bouncer diagnostics", report))
+    Toast.makeText(context, "Diagnostics copied to clipboard", Toast.LENGTH_SHORT).show()
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "Bluetooth Bouncer diagnostics")
+        putExtra(Intent.EXTRA_TEXT, report)
+    }
+    try {
+        context.startActivity(Intent.createChooser(send, "Share diagnostics").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        // Clipboard copy already succeeded — nothing else to do.
     }
 }
 
