@@ -58,6 +58,19 @@ class ShizukuHelper(private val context: Context) {
     @Volatile
     private var bindStartedAt = 0L
 
+    /** Consecutive bind attempts that have not produced a connected UserService. */
+    @Volatile
+    private var failedBindAttempts = 0
+
+    private val _bindProblem = MutableStateFlow<String?>(null)
+
+    /**
+     * Human-readable description of why the UserService won't bind, or null while things are
+     * fine. Set after repeated bind timeouts or a bind error; shown on the setup screen while
+     * the state is stuck at [State.Connecting].
+     */
+    val bindProblem: StateFlow<String?> = _bindProblem.asStateFlow()
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var monitorJob: Job? = null
 
@@ -91,6 +104,8 @@ class ShizukuHelper(private val context: Context) {
             synchronized(this@ShizukuHelper) {
                 userService = IBluetoothBouncerUserService.Stub.asInterface(binder)
                 bindStartedAt = 0L
+                failedBindAttempts = 0
+                _bindProblem.value = null
                 _state.value = State.Ready
             }
         }
@@ -137,7 +152,20 @@ class ShizukuHelper(private val context: Context) {
                 _state.value = State.Connecting
                 // Permission granted — bind the UserService (unless a bind is already in flight)
                 val now = android.os.SystemClock.uptimeMillis()
-                if (bindStartedAt == 0L || now - bindStartedAt > BIND_TIMEOUT_MS) {
+                if (bindStartedAt == 0L) {
+                    bindStartedAt = now
+                    bindUserService()
+                } else if (now - bindStartedAt > BIND_RETRY_MS) {
+                    // The bind never completed. Re-binding alone doesn't help: Shizuku keeps its
+                    // record of our service, and if that service failed to start, every new bind
+                    // just waits on the same dead record. Remove it so the retry starts fresh.
+                    failedBindAttempts++
+                    Log.w(TAG, "UserService bind timed out (attempt $failedBindAttempts) — removing and retrying")
+                    if (failedBindAttempts >= 2) {
+                        _bindProblem.value = "Shizuku hasn't started Bluetooth Bouncer's background service " +
+                            "after $failedBindAttempts attempts. Still retrying."
+                    }
+                    removeUserService()
                     bindStartedAt = now
                     bindUserService()
                 }
@@ -165,6 +193,24 @@ class ShizukuHelper(private val context: Context) {
                 delay(MONITOR_INTERVAL_MS)
             }
         }
+    }
+
+    /**
+     * Discards Shizuku's record of the UserService and binds a fresh one. For the "Retry"
+     * button when the state is stuck at [State.Connecting].
+     */
+    @Synchronized
+    fun restartUserService() {
+        if (!isShizukuRunning() || !hasPermission()) {
+            refreshState()
+            return
+        }
+        Log.i(TAG, "Restarting UserService on request")
+        userService = null
+        removeUserService()
+        bindStartedAt = android.os.SystemClock.uptimeMillis()
+        _state.value = State.Connecting
+        bindUserService()
     }
 
     /** Stop the polling started by [startMonitoring]. */
@@ -346,7 +392,18 @@ class ShizukuHelper(private val context: Context) {
             Shizuku.bindUserService(buildUserServiceArgs(), serviceConnection)
         } catch (e: Exception) {
             Log.e(TAG, "bindUserService failed", e)
+            _bindProblem.value = "Couldn't ask Shizuku to start Bluetooth Bouncer's background " +
+                "service: ${e.message ?: e.javaClass.simpleName}"
             bindStartedAt = 0L
+        }
+    }
+
+    /** Removes our connection and Shizuku's record of the UserService (killing its process). */
+    private fun removeUserService() {
+        try {
+            Shizuku.unbindUserService(buildUserServiceArgs(), serviceConnection, true)
+        } catch (e: Exception) {
+            Log.w(TAG, "removeUserService failed", e)
         }
     }
 
@@ -368,6 +425,9 @@ class ShizukuHelper(private val context: Context) {
 
         /** Milliseconds to wait for the UserService to bind on cold start before giving up. */
         private const val BIND_TIMEOUT_MS = 10_000L
+
+        /** How long a bind may take before it's treated as stuck and retried from scratch. */
+        private const val BIND_RETRY_MS = 12_000L
 
         /** How often [startMonitoring] re-checks Shizuku state while not Ready. */
         private const val MONITOR_INTERVAL_MS = 1_000L

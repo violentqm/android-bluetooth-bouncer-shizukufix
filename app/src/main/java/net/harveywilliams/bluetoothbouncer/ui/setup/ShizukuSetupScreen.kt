@@ -46,8 +46,11 @@ import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 @Composable
 fun ShizukuSetupScreen(
     shizukuState: ShizukuHelper.State,
+    /** Why the Shizuku background service won't start, if known (see [ShizukuHelper.bindProblem]). */
+    bindProblem: String?,
     /** Returns false if Shizuku won't show its prompt, so the user must grant it in Shizuku. */
     onRequestPermission: () -> Boolean,
+    onRetryConnect: () -> Unit,
     onNavigateToDeviceList: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -160,7 +163,30 @@ fun ShizukuSetupScreen(
                     }
                 }
 
-                is ShizukuHelper.State.Connecting -> { /* Transient — nothing to do */ }
+                is ShizukuHelper.State.Connecting -> {
+                    if (bindProblem != null) {
+                        Text(
+                            text = "$bindProblem\n\nIf this keeps happening, open Shizuku, stop it, " +
+                                "start it again, then tap Retry.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onRetryConnect,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Retry")
+                    }
+                    if (shizukuLaunchIntent != null) {
+                        OutlinedButton(
+                            onClick = { openShizuku(context, shizukuLaunchIntent) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Open Shizuku")
+                        }
+                    }
+                }
             }
 
             // ── Setup instructions ───────────────────────────────────────────

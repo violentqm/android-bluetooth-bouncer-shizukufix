@@ -353,14 +353,17 @@ class DeviceListViewModel(
     }
 
     /**
-     * Called by the UI with the result from the CDM association dialog.
-     * [Activity.RESULT_OK] means the user confirmed — [onSuccess] in [toggleWatch] handles it.
+     * Called by the UI with the result from the CDM association dialog (shown by both the Alert
+     * toggle and Connect on a blocked device).
+     * [Activity.RESULT_OK] means the user confirmed — the `onSuccess` callback handles it.
      * Any other result means the user cancelled or the dialog failed.
      */
     fun onWatchAssociationResult(resultCode: Int) {
         _watchAssociationIntent.value = null
         if (resultCode != Activity.RESULT_OK) {
-            _uiState.update { it.copy(watchLoadingAddress = null) }
+            // The dialog serves both Alert and Connect — clear whichever was waiting on it,
+            // or its button stays stuck ("Connecting...") forever.
+            _uiState.update { it.copy(watchLoadingAddress = null, connectLoadingAddress = null) }
             pendingWatchDevice = null
         }
         // RESULT_OK: onAssociationCreated already fired and is handled by the onSuccess callback.

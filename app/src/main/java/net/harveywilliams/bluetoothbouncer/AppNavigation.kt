@@ -39,6 +39,7 @@ fun AppNavigation(
     )
     val uiState by viewModel.uiState.collectAsState()
     val watchAssociationIntent by viewModel.watchAssociationIntent.collectAsState()
+    val shizukuBindProblem by app.shizukuHelper.bindProblem.collectAsState()
 
     NavHost(navController = navController, startDestination = Routes.DEVICE_LIST) {
 
@@ -63,7 +64,9 @@ fun AppNavigation(
         composable(Routes.SHIZUKU_SETUP) {
             ShizukuSetupScreen(
                 shizukuState = uiState.shizukuState,
+                bindProblem = shizukuBindProblem,
                 onRequestPermission = { app.shizukuHelper.requestPermission() },
+                onRetryConnect = { app.shizukuHelper.restartUserService() },
                 onNavigateToDeviceList = {
                     navController.popBackStack(Routes.DEVICE_LIST, inclusive = false)
                 },
