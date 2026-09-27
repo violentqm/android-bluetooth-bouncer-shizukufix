@@ -59,9 +59,10 @@ Bluetooth Bouncer adds a missing toggle: per-device control over auto-connect. S
 | **Block / Allow** | Toggle auto-connection per device. Blocked devices stay paired but won't connect on their own. |
 | **Connect / Disconnect** | Tap Connect to immediately connect a device (temporarily allows blocked devices; allowed devices connect directly). Tap Disconnect to kick a connected device off. *(Android 13+ only)* |
 | **Alerts** | Get notified when a blocked device comes into range, so you can decide whether to let it in. *(Android 13+ only)* |
-| **Temporary Allow** | Tap the notification to let a blocked device connect just for this session. It goes back to blocked automatically when the device leaves range. Also triggered by the Connect button on a blocked device. |
+| **Temporary Allow** | Tap "Allow temporarily" on the notification to let a blocked device connect just for this session — Bluetooth Bouncer also asks the device to connect straight away. It goes back to blocked automatically when the device leaves range or the phone restarts. Also triggered by the Connect button on a blocked device. |
 | **Survives Reboots** | Your blocks stick around even after restarting your phone. |
 | **Re-pair Protection** | If you unpair and re-pair a blocked device, the block is automatically re-applied. No surprise reconnections. |
+| **Self-Healing Blocks** | If a block couldn't be applied while Shizuku was stopped (e.g. a device was re-paired, or left range during a temporary allow), it's re-applied automatically as soon as Shizuku is running again, at boot, or when Bluetooth is turned on. |
 | **Live Status** | See at a glance which devices are connected, detected nearby, or were recently seen. |
 
 ## Requirements

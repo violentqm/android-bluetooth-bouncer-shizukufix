@@ -28,13 +28,20 @@ object BluetoothAclHelper {
      *
      * Returns false on any reflection failure so callers degrade gracefully.
      */
-    fun isConnected(device: BluetoothDevice): Boolean {
+    fun isConnected(device: BluetoothDevice): Boolean = isConnectedOrNull(device) ?: false
+
+    /**
+     * Like [isConnected], but returns null when the connection state can't be determined
+     * (reflection failure, missing permission). Use this where treating "unknown" as
+     * "disconnected" would be harmful — e.g. before re-blocking a device the user allowed.
+     */
+    fun isConnectedOrNull(device: BluetoothDevice): Boolean? {
         return try {
             val method = BluetoothDevice::class.java.getDeclaredMethod("isConnected")
-            method.invoke(device) as? Boolean ?: false
+            method.invoke(device) as? Boolean
         } catch (e: Exception) {
             Log.w(TAG, "isConnected reflection failed for ${device.address}", e)
-            false
+            null
         }
     }
 

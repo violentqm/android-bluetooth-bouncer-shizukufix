@@ -4,13 +4,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import kotlinx.coroutines.flow.first
-import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 
 /**
- * Re-applies FORBIDDEN policies for all blocked devices on boot,
- * but only if Shizuku is running. Handles the edge case where a device
- * was re-paired while Shizuku wasn't available.
+ * Re-applies FORBIDDEN policies for all blocked devices on boot, if Shizuku is running.
+ * Handles the edge cases where a device was re-paired while Shizuku wasn't available, or the
+ * phone was restarted in the middle of a temporary-allow session (a reboot ends the session).
+ *
+ * If Shizuku isn't running yet, nothing is lost: [PolicyEnforcer.reconcile] also runs as soon
+ * as Shizuku becomes ready (see [BluetoothBouncerApp]).
  */
 class BootReceiver : BroadcastReceiver() {
 
@@ -20,24 +21,13 @@ class BootReceiver : BroadcastReceiver() {
         Log.d(TAG, "Boot completed — re-applying blocked device policies")
 
         launchAsync(context) { app ->
-            app.shizukuHelper.refreshState()
-
-            if (app.shizukuHelper.state.value !is ShizukuHelper.State.Ready) {
-                Log.i(TAG, "Shizuku not ready at boot — skipping policy re-application")
+            // The process has only just started, so the UserService is still binding —
+            // wait for it rather than checking the state once and giving up.
+            if (!app.shizukuHelper.awaitReady()) {
+                Log.i(TAG, "Shizuku not ready at boot — will reconcile when it starts")
                 return@launchAsync
             }
-
-            val blockedDevices = app.database.blockedDeviceDao().getAllDevices().first()
-            Log.d(TAG, "Re-applying FORBIDDEN for ${blockedDevices.size} blocked device(s)")
-
-            for (device in blockedDevices) {
-                val result = app.shizukuHelper.setConnectionPolicy(device.macAddress, ShizukuHelper.POLICY_FORBIDDEN)
-                if (result.isFailure) {
-                    Log.w(TAG, "Failed to re-apply policy for ${device.macAddress}: ${result.exceptionOrNull()?.message}")
-                } else {
-                    Log.d(TAG, "Re-applied FORBIDDEN for ${device.macAddress}")
-                }
-            }
+            app.policyEnforcer.reconcile("boot")
         }
     }
 

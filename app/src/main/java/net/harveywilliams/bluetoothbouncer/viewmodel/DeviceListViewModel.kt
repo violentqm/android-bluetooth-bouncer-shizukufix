@@ -40,6 +40,7 @@ import net.harveywilliams.bluetoothbouncer.BluetoothBouncerApp
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceDao
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceEntity
 import net.harveywilliams.bluetoothbouncer.service.DeviceWatchManager
+import net.harveywilliams.bluetoothbouncer.service.PolicyEnforcer
 import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 import net.harveywilliams.bluetoothbouncer.util.BluetoothAclHelper
 
@@ -47,6 +48,7 @@ class DeviceListViewModel(
     application: Application,
     private val shizukuHelper: ShizukuHelper,
     private val blockedDeviceDao: BlockedDeviceDao,
+    private val policyEnforcer: PolicyEnforcer,
 ) : AndroidViewModel(application) {
 
     // ── UI model ─────────────────────────────────────────────────────────────
@@ -92,6 +94,8 @@ class DeviceListViewModel(
         val connectLoadingAddress: String? = null,
         /** MAC address of a device whose Disconnect action is in-flight. */
         val disconnectLoadingAddress: String? = null,
+        /** MAC addresses whose Block/Allow toggle is in-flight. Their switches are disabled. */
+        val toggleLoadingAddresses: Set<String> = emptySet(),
     )
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -155,6 +159,14 @@ class DeviceListViewModel(
     /** Running decay ticker coroutine, or null when no recent-detection timestamps are active. */
     private var decayTickerJob: Job? = null
 
+    /**
+     * Block/Allow toggles in flight: address → the `isBlocked` value being applied. While an
+     * entry exists, [refreshDeviceList] shows the target value (so a refresh from Room mid-flight
+     * doesn't flick the switch back) and further toggles for that device are ignored (so a
+     * double-tap can't fire two racing policy changes). Main-thread only.
+     */
+    private val pendingBlockTargets: MutableMap<String, Boolean> = mutableMapOf()
+
     init {
         // Sole long-lived collector on the Room Flow — observes Shizuku state and the
         // blocked-device table together so any Room change triggers a UI refresh.
@@ -214,57 +226,68 @@ class DeviceListViewModel(
     /**
      * Toggle block/unblock for a device.
      * Applies an optimistic update, calls Shizuku, updates Room on success,
-     * or reverts on failure.
+     * or reverts on failure. Ignored while a toggle for the same device is still in flight.
      *
      * When unblocking a watched device (non-null [cdmAssociationId]), this also runs
      * the disable-watch flow ([DeviceWatchManager.disableWatch]) before deleting the Room row.
+     *
+     * The policy change and Room write run under [PolicyEnforcer.withPolicyLock] so a
+     * background reconcile can't slip in between them and undo the change.
      */
     fun toggleBlock(device: DeviceUiModel) {
+        if (device.address in pendingBlockTargets) return
         val newBlocked = !device.isBlocked
 
         // Optimistic update
+        pendingBlockTargets[device.address] = newBlocked
         _uiState.update { state ->
-            state.copy(devices = state.devices.map { d ->
-                if (d.address == device.address) d.copy(isBlocked = newBlocked) else d
-            })
+            state.copy(
+                devices = state.devices.map { d ->
+                    if (d.address == device.address) d.copy(isBlocked = newBlocked) else d
+                },
+                toggleLoadingAddresses = state.toggleLoadingAddresses + device.address,
+            )
         }
 
         viewModelScope.launch {
-            val policy = if (newBlocked) ShizukuHelper.POLICY_FORBIDDEN else ShizukuHelper.POLICY_ALLOWED
-            val result = shizukuHelper.setConnectionPolicy(device.address, policy)
-
-            if (result.isSuccess) {
-                if (newBlocked) {
-                    blockedDeviceDao.insertDevice(
-                        BlockedDeviceEntity(
-                            macAddress = device.address,
-                            deviceName = device.name,
-                            timestamp = System.currentTimeMillis()
-                        )
-                    )
-                } else {
-                    // Unblocking: clean up CDM association if one exists (from Alert or Connect)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        val entity = blockedDeviceDao.getDeviceByMac(device.address)
-                        val assocId = entity?.cdmAssociationId
-                        if (assocId != null) {
-                            deviceWatchManager?.disableWatchAndDisassociate(device.address, assocId)
+            try {
+                val result = policyEnforcer.withPolicyLock {
+                    val policy = if (newBlocked) ShizukuHelper.POLICY_FORBIDDEN else ShizukuHelper.POLICY_ALLOWED
+                    shizukuHelper.setConnectionPolicy(device.address, policy).also { result ->
+                        if (result.isSuccess) {
+                            if (newBlocked) {
+                                blockedDeviceDao.insertDevice(
+                                    BlockedDeviceEntity(
+                                        macAddress = device.address,
+                                        deviceName = device.name,
+                                        timestamp = System.currentTimeMillis()
+                                    )
+                                )
+                            } else {
+                                // Unblocking: clean up CDM association if one exists (from Alert or Connect)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    val entity = blockedDeviceDao.getDeviceByMac(device.address)
+                                    val assocId = entity?.cdmAssociationId
+                                    if (assocId != null) {
+                                        deviceWatchManager?.disableWatchAndDisassociate(device.address, assocId)
+                                    }
+                                }
+                                blockedDeviceDao.deleteDevice(device.address)
+                            }
                         }
                     }
-                    blockedDeviceDao.deleteDevice(device.address)
                 }
-            } else {
-                // Revert toggle and show error
-                val errorMsg = if (newBlocked) "Failed to block ${device.name}" else "Failed to unblock ${device.name}"
-                Log.w(TAG, "$errorMsg: ${result.exceptionOrNull()?.message}")
-                _uiState.update { state ->
-                    state.copy(
-                        devices = state.devices.map { d ->
-                            if (d.address == device.address) d.copy(isBlocked = device.isBlocked) else d
-                        },
-                        toggleError = errorMsg
-                    )
+                if (result.isFailure) {
+                    val errorMsg = if (newBlocked) "Failed to block ${device.name}" else "Failed to unblock ${device.name}"
+                    Log.w(TAG, "$errorMsg: ${result.exceptionOrNull()?.message}")
+                    _uiState.update { it.copy(toggleError = errorMsg) }
                 }
+            } finally {
+                // Drop the optimistic override and rebuild from Room — shows the new state on
+                // success and reverts the switch on failure.
+                pendingBlockTargets.remove(device.address)
+                _uiState.update { it.copy(toggleLoadingAddresses = it.toggleLoadingAddresses - device.address) }
+                refreshDevices()
             }
         }
     }
@@ -352,7 +375,7 @@ class DeviceListViewModel(
      *
      * After a successful Shizuku IPC call, [connectLoadingAddress] remains set and
      * [awaitConnectionOrTimeout] takes over: it observes [_uiState] for [DeviceUiModel.isConnected]
-     * and clears the loading state once confirmed or after a 5-second timeout (with rollback).
+     * and clears the loading state once confirmed or after [CONNECT_TIMEOUT_MS] (with rollback).
      */
     fun connectDevice(device: DeviceUiModel) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
@@ -377,10 +400,11 @@ class DeviceListViewModel(
                             try {
                                 // Start CDM observation so DeviceWatcherService can auto-revert
                                 manager.startObservingForConnect(device.address, associationId)
-                                // Set policy to allowed + mark as temporarily allowed
-                                val result = shizukuHelper.setConnectionPolicy(device.address, ShizukuHelper.POLICY_ALLOWED)
+                                // Set policy to allowed, mark as temporarily allowed, and ask the
+                                // device to connect (changing the policy alone only lets it connect
+                                // the next time the device itself tries).
+                                val result = policyEnforcer.allowTemporarily(device.address)
                                 if (result.isSuccess) {
-                                    blockedDeviceDao.updateIsTemporarilyAllowed(device.address, true)
                                     // IPC succeeded — wait for OS connection (clears loading on its own)
                                     awaitConnectionOrTimeout(device.address, device.name, isBlockedConnect = true)
                                 } else {
@@ -423,7 +447,7 @@ class DeviceListViewModel(
 
     /**
      * Suspends until the device at [address] becomes connected (as observed via [_uiState]),
-     * or until a 5-second timeout elapses.
+     * or until [CONNECT_TIMEOUT_MS] elapses.
      *
      * On success: clears [UiState.connectLoadingAddress].
      * On timeout:
@@ -449,10 +473,7 @@ class DeviceListViewModel(
         } catch (e: TimeoutCancellationException) {
             Log.w(TAG, "awaitConnectionOrTimeout: timed out waiting for $address to connect")
             if (isBlockedConnect) {
-                try {
-                    shizukuHelper.setConnectionPolicy(address, ShizukuHelper.POLICY_FORBIDDEN)
-                    blockedDeviceDao.updateIsTemporarilyAllowed(address, false)
-                } catch (re: Exception) {
+                policyEnforcer.reblock(address).onFailure { re ->
                     Log.w(TAG, "awaitConnectionOrTimeout: rollback failed for $address", re)
                 }
             }
@@ -462,7 +483,9 @@ class DeviceListViewModel(
 
     /**
      * Disconnects a device:
-     *  - Blocked or temp-allowed device: re-applies POLICY_FORBIDDEN and clears temp-allowed flag
+     *  - Blocked or temp-allowed device: best-effort disconnect, then re-applies POLICY_FORBIDDEN
+     *    and clears the temp-allowed flag. The re-block is what matters (forbidding the policy
+     *    drops the profiles too), so a failed disconnect no longer leaves the device allowed.
      *  - Allowed device: active profile disconnect only, no policy change (Android may auto-reconnect)
      *
      * API 33+ only — callers must guard with the same check.
@@ -474,25 +497,17 @@ class DeviceListViewModel(
 
         viewModelScope.launch {
             try {
-                val disconnectResult = shizukuHelper.disconnectDevice(device.address)
-                if (disconnectResult.isFailure) {
-                    val msg = "Failed to disconnect ${device.name}"
-                    Log.w(TAG, "$msg: ${disconnectResult.exceptionOrNull()?.message}")
-                    _uiState.update { it.copy(toggleError = msg) }
-                    return@launch
+                val result = if (device.isBlocked || device.isTemporarilyAllowed) {
+                    // Room write (temp-allowed flag cleared) triggers the Application-scoped
+                    // notification observer, which posts the "Nearby" notification automatically.
+                    policyEnforcer.reblock(device.address, disconnectFirst = true)
+                } else {
+                    shizukuHelper.disconnectDevice(device.address)
                 }
-                // For blocked/temp-allowed devices, also re-apply POLICY_FORBIDDEN
-                if (device.isBlocked || device.isTemporarilyAllowed) {
-                    val policyResult = shizukuHelper.setConnectionPolicy(device.address, ShizukuHelper.POLICY_FORBIDDEN)
-                    if (policyResult.isSuccess) {
-                        if (device.isTemporarilyAllowed) {
-                            blockedDeviceDao.updateIsTemporarilyAllowed(device.address, false)
-                            // Room write triggers the Application-scoped notification observer,
-                            // which will post the "Nearby" notification automatically.
-                        }
-                    } else {
-                        Log.w(TAG, "disconnectDevice: re-block failed for ${device.address}: ${policyResult.exceptionOrNull()?.message}")
-                    }
+                if (result.isFailure) {
+                    val msg = "Failed to disconnect ${device.name}"
+                    Log.w(TAG, "$msg: ${result.exceptionOrNull()?.message}")
+                    _uiState.update { it.copy(toggleError = msg) }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "disconnectDevice failed for ${device.address}", e)
@@ -668,16 +683,19 @@ class DeviceListViewModel(
             val isConn = device.address in connectedAddresses
             val isDet = device.address in detectedAddresses
             val isRecent = secondsAgo != null
+            // An in-flight toggle shows its target value until it completes.
+            val isBlocked = pendingBlockTargets[device.address] ?: (device.address in blockedAddresses)
             val section = computeSection(
                 isConnected = isConn,
                 isDetected = isDet,
-                isBlocked = device.address in blockedAddresses,
+                isBlocked = isBlocked,
                 hasRecentDetection = isRecent,
             )
             DeviceUiModel(
                 address = device.address,
-                name = device.name ?: device.address,
-                isBlocked = device.address in blockedAddresses,
+                // Prefer the name the user gave the device in Bluetooth settings.
+                name = device.alias ?: device.name ?: device.address,
+                isBlocked = isBlocked,
                 isConnected = isConn,
                 isDetected = isDet,
                 isWatched = device.address in watchedAddresses,
@@ -781,15 +799,16 @@ class DeviceListViewModel(
 
         /** How long to wait for [DeviceUiModel.isConnected] to become true after a successful
          *  Shizuku IPC call before treating the attempt as failed and rolling back. */
-        private const val CONNECT_TIMEOUT_MS = 5_000L
+        private const val CONNECT_TIMEOUT_MS = 12_000L
 
         fun factory(
             shizukuHelper: ShizukuHelper,
             blockedDeviceDao: BlockedDeviceDao,
+            policyEnforcer: PolicyEnforcer,
         ): ViewModelProvider.Factory = viewModelFactory {
             initializer {
                 val app = checkNotNull(this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY])
-                DeviceListViewModel(app, shizukuHelper, blockedDeviceDao)
+                DeviceListViewModel(app, shizukuHelper, blockedDeviceDao, policyEnforcer)
             }
         }
     }

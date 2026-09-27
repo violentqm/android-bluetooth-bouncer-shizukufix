@@ -1,7 +1,9 @@
 package net.harveywilliams.bluetoothbouncer.ui.setup
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,10 +46,14 @@ import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 @Composable
 fun ShizukuSetupScreen(
     shizukuState: ShizukuHelper.State,
-    onRequestPermission: () -> Unit,
+    /** Returns false if Shizuku won't show its prompt, so the user must grant it in Shizuku. */
+    onRequestPermission: () -> Boolean,
     onNavigateToDeviceList: () -> Unit,
 ) {
     val context = LocalContext.current
+    val shizukuLaunchIntent = remember(shizukuState) {
+        context.packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
+    }
 
     // 4.2 — Live status: when Shizuku becomes Ready, auto-navigate to device list
     LaunchedEffect(shizukuState) {
@@ -104,10 +111,43 @@ fun ShizukuSetupScreen(
 
                 is ShizukuHelper.State.PermissionDenied -> {
                     Button(
-                        onClick = onRequestPermission,
+                        onClick = {
+                            if (!onRequestPermission()) {
+                                Toast.makeText(
+                                    context,
+                                    "Permission was denied permanently — enable Bluetooth Bouncer under Authorized applications in Shizuku",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                                openShizuku(context, shizukuLaunchIntent)
+                            }
+                        },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Grant Shizuku Permission")
+                    }
+                    Text(
+                        text = "No prompt appeared? Open Shizuku → Authorized applications and turn on Bluetooth Bouncer.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (shizukuLaunchIntent != null) {
+                        OutlinedButton(
+                            onClick = { openShizuku(context, shizukuLaunchIntent) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Open Shizuku")
+                        }
+                    }
+                }
+
+                is ShizukuHelper.State.NotRunning -> {
+                    if (shizukuLaunchIntent != null) {
+                        Button(
+                            onClick = { openShizuku(context, shizukuLaunchIntent) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Open Shizuku")
+                        }
                     }
                 }
 
@@ -120,7 +160,7 @@ fun ShizukuSetupScreen(
                     }
                 }
 
-                else -> { /* NotRunning / Connecting — show instructions only */ }
+                is ShizukuHelper.State.Connecting -> { /* Transient — nothing to do */ }
             }
 
             // ── Setup instructions ───────────────────────────────────────────
@@ -130,6 +170,17 @@ fun ShizukuSetupScreen(
 
             Spacer(Modifier.height(16.dp))
         }
+    }
+}
+
+private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
+
+private fun openShizuku(context: Context, launchIntent: Intent?) {
+    if (launchIntent == null) return
+    try {
+        context.startActivity(launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Couldn't open Shizuku", Toast.LENGTH_SHORT).show()
     }
 }
 

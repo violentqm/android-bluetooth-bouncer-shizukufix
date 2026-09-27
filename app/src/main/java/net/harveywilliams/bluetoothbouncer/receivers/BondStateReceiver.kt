@@ -5,14 +5,17 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 
 /**
  * Listens for Bluetooth bond state changes. When a device transitions to BONDED
  * and was previously in the blocked list, re-applies CONNECTION_POLICY_FORBIDDEN.
  *
  * This handles the case where a user unpairs and re-pairs a blocked device —
- * re-pairing resets the OS-level policy to ALLOWED.
+ * re-pairing resets the OS-level policy to ALLOWED. Re-pairing also ends any temporary
+ * allow that was left over for the device.
+ *
+ * If Shizuku isn't available right now the block is re-applied when it next becomes ready
+ * (see [PolicyEnforcer.reconcile]).
  */
 class BondStateReceiver : BroadcastReceiver() {
 
@@ -36,18 +39,14 @@ class BondStateReceiver : BroadcastReceiver() {
 
             Log.d(TAG, "Device ${device.address} was previously blocked — re-applying FORBIDDEN")
 
-            if (app.shizukuHelper.state.value !is ShizukuHelper.State.Ready) {
-                Log.w(TAG, "Shizuku not ready — cannot re-apply policy for ${device.address}. " +
-                    "Policy will be applied when the user next opens the app with Shizuku running.")
-                app.refreshSignal.tryEmit(Unit)
-                return@launchAsync
-            }
-
-            val result = app.shizukuHelper.setConnectionPolicy(device.address, ShizukuHelper.POLICY_FORBIDDEN)
+            // No "is Shizuku ready?" gate: this broadcast often cold-starts the process, when the
+            // UserService is still binding. The call waits for the bind if Shizuku is running.
+            val result = app.policyEnforcer.reblock(device.address)
             if (result.isSuccess) {
                 Log.d(TAG, "Re-applied FORBIDDEN for re-paired device ${device.address}")
             } else {
-                Log.w(TAG, "Failed to re-apply FORBIDDEN for ${device.address}: ${result.exceptionOrNull()?.message}")
+                Log.w(TAG, "Failed to re-apply FORBIDDEN for ${device.address} — will retry when " +
+                    "Shizuku is ready: ${result.exceptionOrNull()?.message}")
             }
             // Emit so the ViewModel reflects the bond/policy change immediately.
             app.refreshSignal.tryEmit(Unit)

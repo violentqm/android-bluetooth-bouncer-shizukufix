@@ -13,7 +13,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import net.harveywilliams.bluetoothbouncer.BluetoothBouncerApp
-import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
+import net.harveywilliams.bluetoothbouncer.notification.WatchNotificationHelper
 import net.harveywilliams.bluetoothbouncer.util.BluetoothAclHelper
 
 /**
@@ -56,6 +56,8 @@ class DeviceWatcherService : CompanionDeviceService() {
             }
             // Cancel any pending grace-period removal for this device — it's back in range.
             app.nearbyTracker.addDevice(entity.macAddress)
+            // Back in range: a temporary-allow session that was waiting to be re-blocked continues.
+            app.policyEnforcer.cancelDeferredReblock(entity.macAddress)
             Log.d(TAG, "Device appeared: ${entity.deviceName} (${entity.macAddress})")
         }
     }
@@ -63,8 +65,9 @@ class DeviceWatcherService : CompanionDeviceService() {
     /**
      * Called when a CDM-associated device leaves Bluetooth range.
      *
-     * If the device was temporarily allowed and is not actively profile-connected (ACL),
-     * re-applies [ShizukuHelper.POLICY_FORBIDDEN] and clears the temporary-allow flag.
+     * If the device was temporarily allowed and is no longer connected, ends the session:
+     * re-applies POLICY_FORBIDDEN and clears the temporary-allow flag. If it's still connected
+     * (or its state can't be read), the re-block is deferred until the link drops.
      */
     override fun onDeviceDisappeared(associationInfo: AssociationInfo) {
         val associationId = associationInfo.id
@@ -89,23 +92,29 @@ class DeviceWatcherService : CompanionDeviceService() {
                 return@launch
             }
 
-            if (isDeviceAclConnected(entity.macAddress)) {
-                // Still ACL-connected — defer re-block. Keep in nearby set; notification stays visible.
-                Log.d(TAG, "Device ${entity.deviceName} still ACL-connected — deferring re-block")
+            if (isDeviceAclConnected(entity.macAddress) != false) {
+                // Still ACL-connected (or unknown) — defer the re-block until the link drops.
+                // Keep in nearby set so the "Disconnect" notification stays visible meanwhile.
+                Log.d(TAG, "Device ${entity.deviceName} still connected — deferring re-block")
+                app.policyEnforcer.scheduleDeferredReblock(entity.macAddress)
                 return@launch
             }
 
-            val result = app.shizukuHelper.setConnectionPolicy(
-                entity.macAddress,
-                ShizukuHelper.POLICY_FORBIDDEN,
-            )
+            // Removes from the nearby set — the notification observer then cancels the notification.
+            val result = app.policyEnforcer.reblock(entity.macAddress, removeFromNearby = true)
             if (result.isSuccess) {
-                dao.updateIsTemporarilyAllowed(entity.macAddress, false)
-                // Remove from nearby set — the notification observer will cancel the notification.
-                app.nearbyTracker.removeDevice(entity.macAddress)
                 Log.d(TAG, "Re-blocked ${entity.deviceName} after departure")
             } else {
+                // The reconcile that runs when Shizuku is next ready will re-block it. Tell the
+                // user their device is not blocked right now.
                 Log.e(TAG, "Failed to re-block ${entity.deviceName}: ${result.exceptionOrNull()}")
+                WatchNotificationHelper.postErrorNotification(
+                    this@DeviceWatcherService,
+                    entity.macAddress,
+                    entity.deviceName,
+                    "Left range but couldn't be re-blocked — Shizuku unavailable. " +
+                        "It will be blocked again as soon as Shizuku is running.",
+                )
             }
         }
     }
@@ -138,19 +147,19 @@ class DeviceWatcherService : CompanionDeviceService() {
     }
 
     /**
-     * Returns true if a Bluetooth ACL link to the given [macAddress] is still active.
-     * Delegates to [BluetoothAclHelper] which uses the hidden [BluetoothDevice.isConnected]
-     * API via reflection. A live ACL link means at least one profile is still connected.
+     * Returns whether a Bluetooth ACL link to the given [macAddress] is still active, or null
+     * if that can't be determined. Delegates to [BluetoothAclHelper] which uses the hidden
+     * [BluetoothDevice.isConnected] API via reflection.
      */
     @SuppressLint("MissingPermission")
-    private fun isDeviceAclConnected(macAddress: String): Boolean {
+    private fun isDeviceAclConnected(macAddress: String): Boolean? {
         return try {
-            val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
+            val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
             val device = adapter.getRemoteDevice(macAddress)
-            BluetoothAclHelper.isConnected(device)
+            BluetoothAclHelper.isConnectedOrNull(device)
         } catch (e: Exception) {
             Log.w(TAG, "isDeviceAclConnected failed for $macAddress", e)
-            false
+            null
         }
     }
 

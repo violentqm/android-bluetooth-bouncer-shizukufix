@@ -5,17 +5,17 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import net.harveywilliams.bluetoothbouncer.notification.WatchNotificationHelper
-import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
+import net.harveywilliams.bluetoothbouncer.service.PolicyEnforcer
 
 /**
  * Handles the "Allow temporarily" notification action posted by [DeviceWatcherService].
  *
  * On receipt:
- * 1. Calls [ShizukuHelper.setConnectionPolicy] with [ShizukuHelper.POLICY_ALLOWED].
- * 2. Sets `isTemporarilyAllowed = true` in Room on success — the Application-scoped
- *    notification observer reacts to this write and posts the "temporarily allowed"
- *    notification automatically.
- * 3. On failure, posts an error notification instead.
+ * 1. Calls [PolicyEnforcer.allowTemporarily], which sets POLICY_ALLOWED, sets
+ *    `isTemporarilyAllowed = true` in Room, and asks the device to connect. The
+ *    Application-scoped notification observer reacts to the Room write and posts the
+ *    "temporarily allowed" notification automatically.
+ * 2. On failure, posts an error notification instead.
  *
  * Uses [launchAsync] to keep the receiver alive long enough for the Shizuku call to complete.
  */
@@ -29,24 +29,22 @@ class TemporaryAllowReceiver : BroadcastReceiver() {
 
         launchAsync(context) { app ->
             try {
-                val result = app.shizukuHelper.setConnectionPolicy(macAddress, ShizukuHelper.POLICY_ALLOWED)
+                val result = app.policyEnforcer.allowTemporarily(macAddress)
                 if (result.isSuccess) {
-                    app.database.blockedDeviceDao().updateIsTemporarilyAllowed(macAddress, true)
-                    // Room write triggers the Application-scoped notification observer,
-                    // which will post the "Temporarily allowed" notification automatically.
                     Log.d(TAG, "Temporarily allowed $macAddress")
                 } else {
-                    Log.w(TAG, "setConnectionPolicy failed for $macAddress: ${result.exceptionOrNull()}")
-                    WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName)
+                    Log.w(TAG, "allowTemporarily failed for $macAddress: ${result.exceptionOrNull()}")
+                    WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName, ERROR_TEXT)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Unexpected error in TemporaryAllowReceiver for $macAddress", e)
-                WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName)
+                WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName, ERROR_TEXT)
             }
         }
     }
 
     companion object {
         private const val TAG = "TemporaryAllowReceiver"
+        private const val ERROR_TEXT = "Could not allow — Shizuku unavailable"
     }
 }

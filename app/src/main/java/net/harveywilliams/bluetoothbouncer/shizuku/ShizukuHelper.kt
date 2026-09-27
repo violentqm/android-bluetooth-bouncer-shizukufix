@@ -4,8 +4,10 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.os.DeadObjectException
 import android.os.IBinder
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,7 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import net.harveywilliams.bluetoothbouncer.BuildConfig
 import net.harveywilliams.bluetoothbouncer.IBluetoothBouncerUserService
 import rikka.shizuku.Shizuku
@@ -170,22 +173,42 @@ class ShizukuHelper(private val context: Context) {
         monitorJob = null
     }
 
-    /** Request Shizuku permission from the user. */
-    fun requestPermission() {
+    /**
+     * Request Shizuku permission from the user.
+     *
+     * Returns false when Shizuku will not show its permission prompt — the user previously
+     * picked "Deny and don't ask again", so permission can only be granted from inside the
+     * Shizuku app. Callers should send the user there.
+     */
+    fun requestPermission(): Boolean {
         if (!isShizukuRunning()) {
             refreshState()
-            return
+            return true
         }
-        try {
-            if (hasPermission()) {
-                refreshState()
-            } else {
-                Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
+        return try {
+            when {
+                hasPermission() -> refreshState()
+                Shizuku.shouldShowRequestPermissionRationale() -> return false
+                else -> Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
             }
+            true
         } catch (e: Exception) {
             Log.e(TAG, "requestPermission failed", e)
             refreshState()
+            true
         }
+    }
+
+    /**
+     * Suspends until the UserService is [State.Ready], for callers that start cold (boot, a
+     * broadcast) and need Shizuku before doing anything. Returns false straight away if Shizuku
+     * isn't running or permission isn't granted, or after [timeoutMs] if the bind never completes.
+     */
+    suspend fun awaitReady(timeoutMs: Long = BIND_TIMEOUT_MS): Boolean {
+        refreshState()
+        if (_state.value is State.Ready) return true
+        if (!isShizukuRunning() || !hasPermission()) return false
+        return withTimeoutOrNull(timeoutMs) { _state.first { it is State.Ready } } != null
     }
 
     /**
@@ -229,18 +252,26 @@ class ShizukuHelper(private val context: Context) {
     /**
      * Routes an AIDL call through the shared service-access scaffold:
      * waits for the UserService to bind (if needed), checks availability,
-     * invokes [call], validates that at least one profile reported success,
-     * and wraps any exception in a [Result.failure].
+     * invokes [call] off the main thread, validates that at least one profile reported
+     * success, and wraps any exception in a [Result.failure].
+     *
+     * The binder call is synchronous and the UserService can block for several seconds while
+     * its profile proxies connect, so it always runs on [Dispatchers.IO] — callers on the main
+     * thread (the ViewModel) would otherwise freeze the UI.
+     *
+     * If the UserService process has died since we last bound it, the call is retried once
+     * after rebinding.
      */
     private suspend fun callService(
         operationName: String,
+        retryOnDeadService: Boolean = true,
         call: (IBluetoothBouncerUserService) -> IntArray,
     ): Result<IntArray> {
         awaitServiceIfNeeded()
         val service = userService
             ?: return Result.failure(IllegalStateException("Shizuku UserService is not available"))
         return try {
-            val results = call(service)
+            val results = withContext(Dispatchers.IO) { call(service) }
             // Each entry: 1 = success, 0 = call returned false, -1 = proxy unavailable.
             // If no profile reported success the OS state was never changed — treat as failure.
             if (results.none { it == 1 }) {
@@ -252,6 +283,19 @@ class ShizukuHelper(private val context: Context) {
             } else {
                 Result.success(results)
             }
+        } catch (e: DeadObjectException) {
+            Log.w(TAG, "$operationName: UserService died — rebinding", e)
+            synchronized(this) {
+                if (userService === service) userService = null
+            }
+            refreshState()
+            if (retryOnDeadService) {
+                callService(operationName, retryOnDeadService = false, call)
+            } else {
+                Result.failure(e)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "$operationName failed", e)
             Result.failure(e)
@@ -261,13 +305,11 @@ class ShizukuHelper(private val context: Context) {
     /** Suspends until the UserService is ready, or gives up after [BIND_TIMEOUT_MS]. */
     private suspend fun awaitServiceIfNeeded() {
         if (userService == null && isShizukuRunning() && hasPermission()) {
-            try {
-                withTimeout(BIND_TIMEOUT_MS) {
-                    _state.first { it is State.Ready }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Timed out or interrupted waiting for UserService to bind", e)
+            refreshState()
+            val ready = withTimeoutOrNull(BIND_TIMEOUT_MS) {
+                _state.first { it is State.Ready }
             }
+            if (ready == null) Log.w(TAG, "Timed out waiting for UserService to bind")
         }
     }
 

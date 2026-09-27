@@ -229,6 +229,7 @@ fun DeviceListScreen(
                         watchLoadingAddress = uiState.watchLoadingAddress,
                         connectLoadingAddress = uiState.connectLoadingAddress,
                         disconnectLoadingAddress = uiState.disconnectLoadingAddress,
+                        toggleLoadingAddresses = uiState.toggleLoadingAddresses,
                         onToggleBlock = onToggleBlock,
                         onToggleWatch = safeToggleWatch,
                         onConnect = onConnect,
@@ -319,6 +320,7 @@ private fun DeviceList(
     watchLoadingAddress: String?,
     connectLoadingAddress: String?,
     disconnectLoadingAddress: String?,
+    toggleLoadingAddresses: Set<String>,
     onToggleBlock: (DeviceListViewModel.DeviceUiModel) -> Unit,
     onToggleWatch: (DeviceListViewModel.DeviceUiModel) -> Unit,
     onConnect: (DeviceListViewModel.DeviceUiModel) -> Unit,
@@ -346,6 +348,7 @@ private fun DeviceList(
                     isWatchLoading = watchLoadingAddress == device.address,
                     isConnectLoading = connectLoadingAddress == device.address,
                     isDisconnectLoading = disconnectLoadingAddress == device.address,
+                    isToggleLoading = device.address in toggleLoadingAddresses,
                     onToggle = { onToggleBlock(device) },
                     onToggleWatch = { onToggleWatch(device) },
                     onConnect = { onConnect(device) },
@@ -368,6 +371,7 @@ private fun DeviceRow(
     isWatchLoading: Boolean,
     isConnectLoading: Boolean,
     isDisconnectLoading: Boolean,
+    isToggleLoading: Boolean,
     onToggle: () -> Unit,
     onToggleWatch: () -> Unit,
     onConnect: () -> Unit,
@@ -509,12 +513,12 @@ private fun DeviceRow(
                 }
             }
 
-            // Block/allow toggle — disabled when Shizuku is not ready
+            // Block/allow toggle — disabled when Shizuku is not ready or a toggle is in flight
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Switch(
                     checked = device.isBlocked,
                     onCheckedChange = { onToggle() },
-                    enabled = shizukuReady,
+                    enabled = shizukuReady && !isToggleLoading,
                 )
                 Text(
                     text = if (device.isBlocked) "Blocked" else "Allowed",

@@ -1,18 +1,28 @@
 package net.harveywilliams.bluetoothbouncer
 
 import android.app.Application
+import android.bluetooth.BluetoothAdapter
 import android.companion.CompanionDeviceManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import net.harveywilliams.bluetoothbouncer.data.AppDatabase
 import net.harveywilliams.bluetoothbouncer.notification.WatchNotificationHelper
 import net.harveywilliams.bluetoothbouncer.service.NearbyDeviceTracker
+import net.harveywilliams.bluetoothbouncer.service.PolicyEnforcer
 import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 
 /**
@@ -51,6 +61,14 @@ class BluetoothBouncerApp : Application() {
      */
     val nearbyTracker: NearbyDeviceTracker by lazy { NearbyDeviceTracker(applicationScope) }
 
+    /**
+     * Single owner of blocked-device policy changes; re-applies blocks when the OS policy
+     * drifts from Room. See [PolicyEnforcer].
+     */
+    val policyEnforcer: PolicyEnforcer by lazy {
+        PolicyEnforcer(this, database.blockedDeviceDao(), shizukuHelper, nearbyTracker, applicationScope)
+    }
+
     override fun onCreate() {
         super.onCreate()
         WatchNotificationHelper.createNotificationChannel(this)
@@ -62,6 +80,8 @@ class BluetoothBouncerApp : Application() {
             cleanUpStaleCdmAssociations()
         }
         launchNotificationObserver()
+        launchPolicyReconciler()
+        registerBluetoothStateReceiver()
     }
 
     override fun onTerminate() {
@@ -104,6 +124,47 @@ class BluetoothBouncerApp : Application() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Re-applies blocks every time Shizuku becomes ready. Anything that failed while Shizuku
+     * was unavailable (re-pair protection, re-blocking a departed temp-allowed device, boot)
+     * is repaired here — this is the "retry" for all of them.
+     */
+    private fun launchPolicyReconciler() {
+        applicationScope.launch {
+            shizukuHelper.state
+                .map { it is ShizukuHelper.State.Ready }
+                .distinctUntilChanged()
+                .filter { it }
+                .collect { policyEnforcer.reconcile("Shizuku ready") }
+        }
+    }
+
+    /**
+     * Reconciles when Bluetooth is switched on: [PolicyEnforcer.reconcile] skips while the
+     * adapter is off, so blocks that couldn't be re-applied then are caught up here.
+     */
+    private fun registerBluetoothStateReceiver() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                if (state != BluetoothAdapter.STATE_ON) return
+                applicationScope.launch {
+                    // Give the Bluetooth profile services a moment to come up so the
+                    // UserService's proxies are usable.
+                    delay(BLUETOOTH_ON_SETTLE_MS)
+                    policyEnforcer.reconcile("Bluetooth on", force = true)
+                }
+            }
+        }
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        // RECEIVER_EXPORTED so the Bluetooth system service (another package) can deliver it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
         }
     }
 
@@ -153,5 +214,8 @@ class BluetoothBouncerApp : Application() {
          * "Detected recently" label disappear at the same time.
          */
         const val DETECTION_GRACE_PERIOD_MS = 30_000L
+
+        /** Delay after Bluetooth turns on before reconciling, so profile services are up. */
+        private const val BLUETOOTH_ON_SETTLE_MS = 3_000L
     }
 }

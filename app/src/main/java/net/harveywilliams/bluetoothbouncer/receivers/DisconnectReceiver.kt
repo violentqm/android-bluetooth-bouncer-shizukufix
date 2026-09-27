@@ -5,17 +5,19 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import net.harveywilliams.bluetoothbouncer.notification.WatchNotificationHelper
-import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
+import net.harveywilliams.bluetoothbouncer.service.PolicyEnforcer
 
 /**
  * Handles the "Disconnect" notification action on the "temporarily allowed" notification.
  *
- * On receipt:
- * 1. Calls [ShizukuHelper.disconnectDevice] to force-disconnect all profiles.
- * 2. Calls [ShizukuHelper.setConnectionPolicy] with [ShizukuHelper.POLICY_FORBIDDEN] to re-block.
- * 3. Clears `isTemporarilyAllowed = false` in Room — the Application-scoped notification
- *    observer reacts to this write and posts the "Nearby" notification automatically.
- * 5. On failure, posts an error notification instead.
+ * On receipt, calls [PolicyEnforcer.reblock], which:
+ * 1. Best-effort disconnects all profiles.
+ * 2. Re-applies POLICY_FORBIDDEN — this is what matters; it also drops the profiles, so a
+ *    failed disconnect (e.g. the device already dropped) no longer aborts the re-block.
+ * 3. Clears `isTemporarilyAllowed` in Room — the Application-scoped notification observer
+ *    reacts to this write and posts the "Nearby" notification automatically.
+ *
+ * On failure, posts an error notification instead.
  *
  * Uses [launchAsync] to keep the receiver alive long enough for the Shizuku calls to complete.
  */
@@ -29,31 +31,22 @@ class DisconnectReceiver : BroadcastReceiver() {
 
         launchAsync(context) { app ->
             try {
-                val disconnectResult = app.shizukuHelper.disconnectDevice(macAddress)
-                if (disconnectResult.isFailure) {
-                    Log.w(TAG, "disconnectDevice failed for $macAddress: ${disconnectResult.exceptionOrNull()}")
-                    WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName)
-                    return@launchAsync
-                }
-
-                val policyResult = app.shizukuHelper.setConnectionPolicy(macAddress, ShizukuHelper.POLICY_FORBIDDEN)
-                if (policyResult.isSuccess) {
-                    app.database.blockedDeviceDao().updateIsTemporarilyAllowed(macAddress, false)
-                    // Room write triggers the Application-scoped notification observer,
-                    // which will post the "Nearby" notification automatically.
+                val result = app.policyEnforcer.reblock(macAddress, disconnectFirst = true)
+                if (result.isSuccess) {
                     Log.d(TAG, "Disconnected and re-blocked $macAddress")
                 } else {
-                    Log.w(TAG, "setConnectionPolicy failed for $macAddress: ${policyResult.exceptionOrNull()}")
-                    WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName)
+                    Log.w(TAG, "reblock failed for $macAddress: ${result.exceptionOrNull()}")
+                    WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName, ERROR_TEXT)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Unexpected error in DisconnectReceiver for $macAddress", e)
-                WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName)
+                WatchNotificationHelper.postErrorNotification(context, macAddress, deviceName, ERROR_TEXT)
             }
         }
     }
 
     companion object {
         private const val TAG = "DisconnectReceiver"
+        private const val ERROR_TEXT = "Could not disconnect — Shizuku unavailable"
     }
 }

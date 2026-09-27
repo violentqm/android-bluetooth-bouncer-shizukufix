@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import net.harveywilliams.bluetoothbouncer.MainActivity
 import net.harveywilliams.bluetoothbouncer.R
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceEntity
 import net.harveywilliams.bluetoothbouncer.receivers.DisconnectReceiver
@@ -90,6 +91,7 @@ object WatchNotificationHelper {
             .setContentTitle(deviceName)
             .setContentText("Nearby — tap to allow for this session")
             .addAction(0, "Allow temporarily", allowPendingIntent)
+            .setContentIntent(openAppPendingIntent(context))
             .setAutoCancel(false)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -126,6 +128,7 @@ object WatchNotificationHelper {
             .setContentTitle(deviceName)
             .setContentText("Temporarily connected")
             .addAction(0, "Disconnect", disconnectPendingIntent)
+            .setContentIntent(openAppPendingIntent(context))
             .setAutoCancel(false)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
@@ -135,18 +138,34 @@ object WatchNotificationHelper {
     }
 
     /**
-     * Posts an error notification informing the user that Shizuku was not available
-     * when the "Allow temporarily" action was tapped.
+     * Posts an error notification for [deviceName] — e.g. Shizuku was not available when a
+     * notification action was tapped, or a departed device could not be re-blocked.
+     * Tapping it opens the app (where the Shizuku status bar shows what's wrong).
      */
-    fun postErrorNotification(context: Context, macAddress: String, deviceName: String) {
+    fun postErrorNotification(context: Context, macAddress: String, deviceName: String, message: String) {
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_bluetooth)
             .setContentTitle(deviceName)
-            .setContentText("Could not allow — Shizuku unavailable")
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setContentIntent(openAppPendingIntent(context))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
 
         NotificationManagerCompat.from(context).notify(errorNotificationId(macAddress), notification)
+    }
+
+    /** Opens (or brings to front) the app's device list. */
+    private fun openAppPendingIntent(context: Context): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return PendingIntent.getActivity(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 }

@@ -43,6 +43,7 @@ class NearbyDeviceTracker(private val applicationScope: CoroutineScope) {
     /**
      * Pending grace-period removal jobs keyed by MAC address.
      * At most one entry per MAC at any time. Jobs are self-evicting on completion.
+     * Guarded by `this` — callers run on the service's IO threads and the application scope.
      */
     private val pendingRemovals: MutableMap<String, Job> = mutableMapOf()
 
@@ -63,12 +64,18 @@ class NearbyDeviceTracker(private val applicationScope: CoroutineScope) {
      * [DeviceWatcherService.onDeviceDisappeared] for non-temporarily-allowed devices.
      */
     fun scheduleRemoval(mac: String, deviceName: String) {
-        pendingRemovals[mac]?.cancel()
-        pendingRemovals[mac] = applicationScope.launch {
-            delay(DETECTION_GRACE_PERIOD_MS)
-            _nearbyDevices.update { it - mac }
-            pendingRemovals.remove(mac)
-            Log.d(TAG, "Grace period expired — removed $deviceName from nearby set")
+        synchronized(this) {
+            pendingRemovals[mac]?.cancel()
+            lateinit var job: Job
+            job = applicationScope.launch {
+                delay(DETECTION_GRACE_PERIOD_MS)
+                _nearbyDevices.update { it - mac }
+                synchronized(this@NearbyDeviceTracker) {
+                    if (pendingRemovals[mac] === job) pendingRemovals.remove(mac)
+                }
+                Log.d(TAG, "Grace period expired — removed $deviceName from nearby set")
+            }
+            pendingRemovals[mac] = job
         }
         Log.d(TAG, "Grace period started for $deviceName ($mac)")
     }
@@ -80,7 +87,7 @@ class NearbyDeviceTracker(private val applicationScope: CoroutineScope) {
      * within the grace window is not removed from [nearbyDevices].
      */
     fun cancelPendingRemoval(mac: String) {
-        pendingRemovals.remove(mac)?.cancel()
+        synchronized(this) { pendingRemovals.remove(mac) }?.cancel()
     }
 
     /**
@@ -89,6 +96,7 @@ class NearbyDeviceTracker(private val applicationScope: CoroutineScope) {
      * Call when a temporarily-allowed device is explicitly disconnected or re-blocked.
      */
     fun removeDevice(mac: String) {
+        cancelPendingRemoval(mac)
         _nearbyDevices.update { it - mac }
     }
 

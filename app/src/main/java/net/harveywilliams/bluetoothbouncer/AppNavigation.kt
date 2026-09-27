@@ -33,7 +33,8 @@ fun AppNavigation(
     val viewModel: DeviceListViewModel = viewModel(
         factory = DeviceListViewModel.factory(
             shizukuHelper = app.shizukuHelper,
-            blockedDeviceDao = app.database.blockedDeviceDao()
+            blockedDeviceDao = app.database.blockedDeviceDao(),
+            policyEnforcer = app.policyEnforcer,
         )
     )
     val uiState by viewModel.uiState.collectAsState()
