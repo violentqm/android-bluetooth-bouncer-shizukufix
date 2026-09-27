@@ -86,7 +86,7 @@ This app has only been tested with the following setup — it may work on other 
 1. **Install Bluetooth Bouncer** — download the latest APK from [GitHub Releases](https://github.com/harvzor/android-bluetooth-bouncer/releases) and install it on your phone.
 2. **Install [Shizuku](https://github.com/RikkaApps/Shizuku)** from the Play Store or GitHub.
 3. **Start Shizuku** — tap "Setup" in Bluetooth Bouncer and follow the instructions. You can use either Wireless Debugging (no PC needed) or ADB from a computer.
-4. **Grant permission** — Bluetooth Bouncer will ask for Shizuku permission the first time. Tap Allow.
+4. **Grant permission** — Bluetooth Bouncer will ask for Shizuku permission the first time. Tap Allow. Bluetooth Bouncer notices Shizuku starting and the permission being granted straight away — no need to restart the app.
 5. **Block a device** — you'll see all your paired Bluetooth devices. Flip the toggle next to any device to block it.
 
 That's it. The device will stay paired but won't auto-connect anymore.

@@ -8,6 +8,11 @@
 
     <uses-feature android:name="android.software.companion_device_setup" />
 
+    <!-- Package visibility (Android 11+): needed to detect whether the Shizuku app is installed -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <application
         android:name=".BluetoothBouncerApp"
         android:allowBackup="true"

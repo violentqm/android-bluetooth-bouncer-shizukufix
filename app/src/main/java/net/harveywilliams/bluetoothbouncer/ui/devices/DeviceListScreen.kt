@@ -250,6 +250,8 @@ private fun ShizukuStatusBar(
     val (color, text) = when (state) {
         is ShizukuHelper.State.Ready ->
             AppColors.ShizukuReady to "Shizuku: Ready"
+        is ShizukuHelper.State.Connecting ->
+            MaterialTheme.colorScheme.tertiary to "Shizuku: Connecting…"
         is ShizukuHelper.State.PermissionDenied ->
             MaterialTheme.colorScheme.error to "Shizuku: Permission denied"
         is ShizukuHelper.State.NotRunning ->

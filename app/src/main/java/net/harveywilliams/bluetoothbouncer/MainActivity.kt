@@ -22,4 +22,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        // Re-check Shizuku while visible so starting Shizuku or granting permission is
+        // picked up immediately, without restarting the app.
+        (application as BluetoothBouncerApp).shizukuHelper.startMonitoring()
+    }
+
+    override fun onStop() {
+        (application as BluetoothBouncerApp).shizukuHelper.stopMonitoring()
+        super.onStop()
+    }
 }

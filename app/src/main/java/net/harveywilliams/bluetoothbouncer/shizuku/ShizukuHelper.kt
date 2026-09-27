@@ -6,10 +6,17 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import net.harveywilliams.bluetoothbouncer.BuildConfig
 import net.harveywilliams.bluetoothbouncer.IBluetoothBouncerUserService
@@ -31,6 +38,9 @@ class ShizukuHelper(private val context: Context) {
         /** Shizuku is running but permission has not been granted to this app. */
         object PermissionDenied : State()
 
+        /** Shizuku is running and permission is granted; the UserService is still binding. */
+        object Connecting : State()
+
         /** Shizuku is running, permission granted, UserService is bound and ready. */
         object Ready : State()
     }
@@ -38,7 +48,15 @@ class ShizukuHelper(private val context: Context) {
     private val _state = MutableStateFlow<State>(State.NotRunning)
     val state: StateFlow<State> = _state.asStateFlow()
 
+    @Volatile
     private var userService: IBluetoothBouncerUserService? = null
+
+    /** Uptime (ms) at which the in-flight UserService bind was started, or 0 if none. */
+    @Volatile
+    private var bindStartedAt = 0L
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var monitorJob: Job? = null
 
     // ── Shizuku listeners ────────────────────────────────────────────────────
 
@@ -50,17 +68,15 @@ class ShizukuHelper(private val context: Context) {
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         Log.d(TAG, "Shizuku binder dead")
         userService = null
-        _state.value = State.NotRunning
+        bindStartedAt = 0L
+        refreshState()
     }
 
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
             if (requestCode == PERMISSION_REQUEST_CODE) {
-                if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                    refreshState()
-                } else {
-                    _state.value = State.PermissionDenied
-                }
+                Log.d(TAG, "Permission result: $grantResult")
+                refreshState()
             }
         }
 
@@ -69,14 +85,20 @@ class ShizukuHelper(private val context: Context) {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             Log.d(TAG, "UserService connected")
-            userService = IBluetoothBouncerUserService.Stub.asInterface(binder)
-            _state.value = State.Ready
+            synchronized(this@ShizukuHelper) {
+                userService = IBluetoothBouncerUserService.Stub.asInterface(binder)
+                bindStartedAt = 0L
+                _state.value = State.Ready
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
             Log.d(TAG, "UserService disconnected")
-            userService = null
-            _state.value = if (isShizukuRunning()) State.PermissionDenied else State.NotRunning
+            synchronized(this@ShizukuHelper) {
+                userService = null
+                bindStartedAt = 0L
+                refreshState()
+            }
         }
     }
 
@@ -89,22 +111,33 @@ class ShizukuHelper(private val context: Context) {
 
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /** Manually re-check and update the current Shizuku state. */
+    /**
+     * Manually re-check and update the current Shizuku state.
+     *
+     * "Running" is checked before "installed": a live Shizuku binder is proof enough that
+     * Shizuku (or Sui, or a fork with a different package name) is available, regardless of
+     * whether its package is visible to us.
+     */
+    @Synchronized
     fun refreshState() {
         when {
-            !isShizukuInstalled() -> {
-                _state.value = State.NotInstalled
-            }
             !isShizukuRunning() -> {
                 userService = null
-                _state.value = State.NotRunning
+                bindStartedAt = 0L
+                _state.value = if (isShizukuInstalled()) State.NotRunning else State.NotInstalled
             }
             !hasPermission() -> {
                 _state.value = State.PermissionDenied
             }
-            userService == null -> {
-                // Permission granted — bind the UserService
-                bindUserService()
+            userService?.asBinder()?.isBinderAlive != true -> {
+                userService = null
+                _state.value = State.Connecting
+                // Permission granted — bind the UserService (unless a bind is already in flight)
+                val now = android.os.SystemClock.uptimeMillis()
+                if (bindStartedAt == 0L || now - bindStartedAt > BIND_TIMEOUT_MS) {
+                    bindStartedAt = now
+                    bindUserService()
+                }
             }
             else -> {
                 _state.value = State.Ready
@@ -112,10 +145,46 @@ class ShizukuHelper(private val context: Context) {
         }
     }
 
+    /**
+     * Start polling Shizuku state while the UI is visible. The Shizuku library does not
+     * notify us of every transition (e.g. permission granted from inside the Shizuku app,
+     * or a missed binder broadcast), so a cheap periodic re-check keeps the UI accurate.
+     * Polling pauses once [State.Ready] is reached and resumes if the state regresses.
+     * Call from Activity.onStart; pair with [stopMonitoring] in onStop.
+     */
+    fun startMonitoring() {
+        if (monitorJob?.isActive == true) return
+        monitorJob = scope.launch {
+            while (isActive) {
+                if (_state.value !is State.Ready || userService?.asBinder()?.isBinderAlive != true) {
+                    refreshState()
+                }
+                delay(MONITOR_INTERVAL_MS)
+            }
+        }
+    }
+
+    /** Stop the polling started by [startMonitoring]. */
+    fun stopMonitoring() {
+        monitorJob?.cancel()
+        monitorJob = null
+    }
+
     /** Request Shizuku permission from the user. */
     fun requestPermission() {
-        if (isShizukuRunning()) {
-            Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
+        if (!isShizukuRunning()) {
+            refreshState()
+            return
+        }
+        try {
+            if (hasPermission()) {
+                refreshState()
+            } else {
+                Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "requestPermission failed", e)
+            refreshState()
         }
     }
 
@@ -148,6 +217,7 @@ class ShizukuHelper(private val context: Context) {
 
     /** Release all Shizuku listeners and unbind the service. Call from Application.onTerminate or similar. */
     fun cleanup() {
+        stopMonitoring()
         Shizuku.removeBinderReceivedListener(binderReceivedListener)
         Shizuku.removeBinderDeadListener(binderDeadListener)
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
@@ -234,6 +304,7 @@ class ShizukuHelper(private val context: Context) {
             Shizuku.bindUserService(buildUserServiceArgs(), serviceConnection)
         } catch (e: Exception) {
             Log.e(TAG, "bindUserService failed", e)
+            bindStartedAt = 0L
         }
     }
 
@@ -255,6 +326,9 @@ class ShizukuHelper(private val context: Context) {
 
         /** Milliseconds to wait for the UserService to bind on cold start before giving up. */
         private const val BIND_TIMEOUT_MS = 10_000L
+
+        /** How often [startMonitoring] re-checks Shizuku state while not Ready. */
+        private const val MONITOR_INTERVAL_MS = 1_000L
 
         /** BluetoothProfile.CONNECTION_POLICY_FORBIDDEN */
         const val POLICY_FORBIDDEN = 0

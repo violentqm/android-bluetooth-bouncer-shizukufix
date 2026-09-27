@@ -120,7 +120,7 @@ fun ShizukuSetupScreen(
                     }
                 }
 
-                else -> { /* NotRunning — show instructions only */ }
+                else -> { /* NotRunning / Connecting — show instructions only */ }
             }
 
             // ── Setup instructions ───────────────────────────────────────────
@@ -153,6 +153,12 @@ private fun ShizukuStatusCard(state: ShizukuHelper.State) {
             color = MaterialTheme.colorScheme.tertiary,
             title = "Shizuku: Permission Required",
             description = "Bluetooth Bouncer needs permission to use Shizuku. Tap the button below to grant it."
+        )
+        is ShizukuHelper.State.Connecting -> StatusInfo(
+            icon = Icons.Default.Info,
+            color = MaterialTheme.colorScheme.secondary,
+            title = "Shizuku: Connecting…",
+            description = "Shizuku is running and permission is granted. Starting the Bluetooth Bouncer service…"
         )
         is ShizukuHelper.State.Ready -> StatusInfo(
             icon = Icons.Default.CheckCircle,
