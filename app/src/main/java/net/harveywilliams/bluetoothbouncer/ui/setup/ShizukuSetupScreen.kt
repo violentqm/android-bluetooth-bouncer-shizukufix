@@ -283,7 +283,7 @@ private fun ShizukuStatusCard(state: ShizukuHelper.State) {
             icon = Icons.Default.Info,
             color = MaterialTheme.colorScheme.secondary,
             title = "Shizuku: Connecting…",
-            description = "Shizuku is running and permission is granted. Starting the Bluetooth Bouncer service…"
+            description = "Shizuku is running and permission is granted. Starting Bluetooth Bouncer's helper — on some phones this takes a few extra seconds the first time."
         )
         is ShizukuHelper.State.Ready -> StatusInfo(
             icon = Icons.Default.CheckCircle,

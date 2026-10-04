@@ -70,6 +70,8 @@ Bluetooth Bouncer adds a missing toggle: per-device control over auto-connect. S
 - **Android 12 or higher** (API 31+)
 - **[Shizuku](https://github.com/RikkaApps/Shizuku)** — a free app that gives Bluetooth Bouncer the elevated access it needs. Android normally restricts the connection-policy API to system apps; Shizuku bridges that gap without requiring root. Bluetooth Bouncer will guide you through setup if Shizuku isn't running.
 
+> **Phones where Shizuku can't start app services** (reported on Xiaomi/HyperOS with MediaTek chips, TCL, Realme UI and some vivo builds): Bluetooth Bouncer notices when Shizuku's background service doesn't start and switches to its own helper process run through Shizuku's shell instead. The first connection on such a phone takes a few extra seconds; after that it uses the helper straight away. If setup still stays on "Connecting…", tap **Copy diagnostics** on the setup screen and include the report in a bug report.
+
 > **Alert and Connect/Disconnect features** require Android 13+ (API 33+). The toggles and buttons simply won't appear on older versions.
 
 > **Note on Disconnect for allowed devices:** Disconnecting an allowed device sends a disconnect signal to its Bluetooth profiles, but Android may immediately reconnect it because the connection policy is still "allowed." If you want a persistent disconnect, use the Block toggle instead.

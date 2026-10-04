@@ -26,8 +26,18 @@ import net.harveywilliams.bluetoothbouncer.IBluetoothBouncerUserService
 import rikka.shizuku.Shizuku
 
 /**
- * Manages all Shizuku integration: state detection, permission requests,
- * and UserService lifecycle.
+ * Manages all Shizuku integration: state detection, permission requests, and the privileged
+ * helper that does the actual Bluetooth work as the shell user.
+ *
+ * The helper is reached through a [PolicyChannel], which is one of:
+ *  - the Shizuku **UserService** ([BluetoothBouncerUserService]) — Shizuku's official API, tried
+ *    first; or
+ *  - the **shell helper** ([ShellChannel] / [ShellMain]) — our own process started through a
+ *    Shizuku shell process. Used when the UserService doesn't connect within
+ *    [USER_SERVICE_TIMEOUT_MS]: on some phones Shizuku's UserService starter fails before any
+ *    of our code runs (see [ShellMain] for the known causes), which used to leave the app stuck
+ *    at "Connecting…" forever. Once the shell helper has had to step in, it's used directly on
+ *    later launches.
  */
 class ShizukuHelper(private val context: Context) {
 
@@ -41,33 +51,54 @@ class ShizukuHelper(private val context: Context) {
         /** Shizuku is running but permission has not been granted to this app. */
         object PermissionDenied : State()
 
-        /** Shizuku is running and permission is granted; the UserService is still binding. */
+        /** Shizuku is running and permission is granted; the privileged helper is starting. */
         object Connecting : State()
 
-        /** Shizuku is running, permission granted, UserService is bound and ready. */
+        /** Shizuku is running, permission granted, and the privileged helper is ready. */
         object Ready : State()
     }
 
     private val _state = MutableStateFlow<State>(State.NotRunning)
     val state: StateFlow<State> = _state.asStateFlow()
 
+    /** Connected UserService, if Shizuku managed to start it. */
     @Volatile
-    private var userService: IBluetoothBouncerUserService? = null
+    private var aidlChannel: AidlChannel? = null
 
-    /** Uptime (ms) at which the in-flight UserService bind was started, or 0 if none. */
+    /** Running shell helper, if one was started. */
+    @Volatile
+    private var shellChannel: ShellChannel? = null
+
+    /** Whether we've asked Shizuku for the UserService in the current Shizuku session. */
+    @Volatile
+    private var bindRequested = false
+
+    /** Uptime (ms) at which the UserService was requested. */
     @Volatile
     private var bindStartedAt = 0L
 
-    /** Consecutive bind attempts that have not produced a connected UserService. */
     @Volatile
-    private var failedBindAttempts = 0
+    private var shellStarting = false
+
+    /** The shell helper failed to start in the current Shizuku session (reset by Retry). */
+    @Volatile
+    private var shellFailed = false
+
+    @Volatile
+    private var lastShellError: String? = null
+
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /** Persisted: the UserService didn't connect on this phone but the shell helper did. */
+    private var preferShellHelper: Boolean
+        get() = prefs.getBoolean(KEY_PREFER_SHELL_HELPER, false)
+        set(value) = prefs.edit().putBoolean(KEY_PREFER_SHELL_HELPER, value).apply()
 
     private val _bindProblem = MutableStateFlow<String?>(null)
 
     /**
-     * Human-readable description of why the UserService won't bind, or null while things are
-     * fine. Set after repeated bind timeouts or a bind error; shown on the setup screen while
-     * the state is stuck at [State.Connecting].
+     * Human-readable description of why the privileged helper can't be started, or null while
+     * things are fine. Shown on the setup screen while the state is stuck at [State.Connecting].
      */
     val bindProblem: StateFlow<String?> = _bindProblem.asStateFlow()
 
@@ -78,13 +109,23 @@ class ShizukuHelper(private val context: Context) {
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         Log.d(TAG, "Shizuku binder received")
+        synchronized(this) {
+            // A (possibly new) Shizuku session — give both helpers a fresh chance.
+            bindRequested = false
+            bindStartedAt = 0L
+            shellFailed = false
+        }
         refreshState()
     }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         Log.d(TAG, "Shizuku binder dead")
-        userService = null
-        bindStartedAt = 0L
+        synchronized(this) {
+            aidlChannel = null
+            dropShellChannel()
+            bindRequested = false
+            bindStartedAt = 0L
+        }
         refreshState()
     }
 
@@ -102,9 +143,7 @@ class ShizukuHelper(private val context: Context) {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             Log.d(TAG, "UserService connected")
             synchronized(this@ShizukuHelper) {
-                userService = IBluetoothBouncerUserService.Stub.asInterface(binder)
-                bindStartedAt = 0L
-                failedBindAttempts = 0
+                aidlChannel = AidlChannel(IBluetoothBouncerUserService.Stub.asInterface(binder))
                 _bindProblem.value = null
                 _state.value = State.Ready
             }
@@ -113,7 +152,9 @@ class ShizukuHelper(private val context: Context) {
         override fun onServiceDisconnected(name: ComponentName) {
             Log.d(TAG, "UserService disconnected")
             synchronized(this@ShizukuHelper) {
-                userService = null
+                aidlChannel = null
+                // Let the next refresh ask again (or fall back to the shell helper).
+                bindRequested = false
                 bindStartedAt = 0L
                 refreshState()
             }
@@ -140,38 +181,21 @@ class ShizukuHelper(private val context: Context) {
     fun refreshState() {
         when {
             !isShizukuRunning() -> {
-                userService = null
+                aidlChannel = null
+                dropShellChannel()
+                bindRequested = false
                 bindStartedAt = 0L
                 _state.value = if (isShizukuInstalled()) State.NotRunning else State.NotInstalled
             }
             !hasPermission() -> {
                 _state.value = State.PermissionDenied
             }
-            userService?.asBinder()?.isBinderAlive != true -> {
-                userService = null
-                _state.value = State.Connecting
-                // Permission granted — bind the UserService (unless a bind is already in flight)
-                val now = android.os.SystemClock.uptimeMillis()
-                if (bindStartedAt == 0L) {
-                    bindStartedAt = now
-                    bindUserService()
-                } else if (now - bindStartedAt > BIND_RETRY_MS) {
-                    // The bind never completed. Re-binding alone doesn't help: Shizuku keeps its
-                    // record of our service, and if that service failed to start, every new bind
-                    // just waits on the same dead record. Remove it so the retry starts fresh.
-                    failedBindAttempts++
-                    Log.w(TAG, "UserService bind timed out (attempt $failedBindAttempts) — removing and retrying")
-                    if (failedBindAttempts >= 2) {
-                        _bindProblem.value = "Shizuku hasn't started Bluetooth Bouncer's background service " +
-                            "after $failedBindAttempts attempts. Still retrying."
-                    }
-                    removeUserService()
-                    bindStartedAt = now
-                    bindUserService()
-                }
+            activeChannel() != null -> {
+                _state.value = State.Ready
             }
             else -> {
-                _state.value = State.Ready
+                _state.value = State.Connecting
+                ensureConnecting()
             }
         }
     }
@@ -187,7 +211,7 @@ class ShizukuHelper(private val context: Context) {
         if (monitorJob?.isActive == true) return
         monitorJob = scope.launch {
             while (isActive) {
-                if (_state.value !is State.Ready || userService?.asBinder()?.isBinderAlive != true) {
+                if (_state.value !is State.Ready || activeChannel() == null) {
                     refreshState()
                 }
                 delay(MONITOR_INTERVAL_MS)
@@ -196,21 +220,21 @@ class ShizukuHelper(private val context: Context) {
     }
 
     /**
-     * Discards Shizuku's record of the UserService and binds a fresh one. For the "Retry"
-     * button when the state is stuck at [State.Connecting].
+     * For the "Retry" button while stuck at [State.Connecting]: restarts the shell helper and
+     * clears earlier failures.
+     *
+     * Deliberately does not remove and re-create the UserService: on some Shizuku builds, once a
+     * UserService has been removed it can't be started again until Shizuku itself is restarted
+     * (thedjchi/Shizuku#201). An earlier version of this app did exactly that on every retry.
      */
     @Synchronized
     fun restartUserService() {
-        if (!isShizukuRunning() || !hasPermission()) {
-            refreshState()
-            return
-        }
-        Log.i(TAG, "Restarting UserService on request")
-        userService = null
-        removeUserService()
-        bindStartedAt = android.os.SystemClock.uptimeMillis()
-        _state.value = State.Connecting
-        bindUserService()
+        Log.i(TAG, "Retrying the privileged helper on request")
+        shellFailed = false
+        lastShellError = null
+        _bindProblem.value = null
+        dropShellChannel()
+        refreshState()
     }
 
     /**
@@ -225,8 +249,13 @@ class ShizukuHelper(private val context: Context) {
         sb.appendLine("Bluetooth Bouncer diagnostics")
         sb.appendLine("App: ${context.packageName} ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         sb.appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
-        sb.appendLine("State: ${_state.value.javaClass.simpleName}, failed bind attempts: $failedBindAttempts, bind in flight: ${bindStartedAt != 0L}")
-        _bindProblem.value?.let { sb.appendLine("Bind problem: $it") }
+        sb.appendLine("State: ${_state.value.javaClass.simpleName}, channel: ${activeChannel()?.kind ?: "none"}")
+        sb.appendLine("UserService: requested=$bindRequested, connected=${aidlChannel?.isAlive() == true}, " +
+            "waited ${if (bindStartedAt == 0L) 0 else (android.os.SystemClock.uptimeMillis() - bindStartedAt) / 1000}s")
+        sb.appendLine("Shell helper: alive=${shellChannel?.isAlive() == true}, starting=$shellStarting, " +
+            "failed=$shellFailed, preferred=$preferShellHelper")
+        lastShellError?.let { sb.appendLine("Shell helper error: $it") }
+        _bindProblem.value?.let { sb.appendLine("Problem: $it") }
         try {
             sb.appendLine("Shizuku: running=${isShizukuRunning()}, version=${Shizuku.getVersion()}, uid=${Shizuku.getUid()}, permission=${hasPermission()}")
         } catch (e: Exception) {
@@ -250,18 +279,7 @@ class ShizukuHelper(private val context: Context) {
      * but still present, so it's called reflectively — this is a diagnostics-only path.
      */
     private fun readSystemLogViaShizuku(): List<String> {
-        val method = Shizuku::class.java.getDeclaredMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java,
-        ).apply { isAccessible = true }
-        val process = method.invoke(
-            null,
-            arrayOf("logcat", "-d", "-v", "time", "-t", "3000"),
-            null,
-            null,
-        ) as java.lang.Process
+        val process = ShellChannel.newShizukuProcess(arrayOf("logcat", "-d", "-v", "time", "-t", "3000"))
         return try {
             process.inputStream.bufferedReader().readLines()
         } finally {
@@ -302,11 +320,11 @@ class ShizukuHelper(private val context: Context) {
     }
 
     /**
-     * Suspends until the UserService is [State.Ready], for callers that start cold (boot, a
-     * broadcast) and need Shizuku before doing anything. Returns false straight away if Shizuku
-     * isn't running or permission isn't granted, or after [timeoutMs] if the bind never completes.
+     * Suspends until the privileged helper is [State.Ready], for callers that start cold (boot,
+     * a broadcast) and need Shizuku before doing anything. Returns false straight away if Shizuku
+     * isn't running or permission isn't granted, or after [timeoutMs] if no helper starts.
      */
-    suspend fun awaitReady(timeoutMs: Long = BIND_TIMEOUT_MS): Boolean {
+    suspend fun awaitReady(timeoutMs: Long = CONNECT_WAIT_MS): Boolean {
         refreshState()
         if (_state.value is State.Ready) return true
         if (!isShizukuRunning() || !hasPermission()) return false
@@ -314,14 +332,13 @@ class ShizukuHelper(private val context: Context) {
     }
 
     /**
-     * Call setConnectionPolicy on the UserService.
-     * Returns a [Result] wrapping the int[] from the service,
-     * or a failure if the service is unavailable.
+     * Call setConnectionPolicy through the privileged helper.
+     * Returns a [Result] wrapping the int[] from the helper,
+     * or a failure if no helper is available.
      *
-     * If [userService] is null but Shizuku is running and permission is granted,
-     * the UserService bind is likely still in progress (common on cold start).
-     * In that case this function suspends and waits up to [BIND_TIMEOUT_MS] for
-     * [State.Ready] before proceeding, rather than failing immediately.
+     * If no helper is connected yet but Shizuku is running and permission is granted, one is
+     * likely still starting (common on cold start). In that case this function suspends and
+     * waits up to [CONNECT_WAIT_MS] for [State.Ready] before proceeding.
      */
     suspend fun setConnectionPolicy(macAddress: String, policy: Int): Result<IntArray> =
         callService("setConnectionPolicy") { it.setConnectionPolicy(macAddress, policy) }
@@ -340,40 +357,40 @@ class ShizukuHelper(private val context: Context) {
     suspend fun disconnectDevice(macAddress: String): Result<IntArray> =
         callService("disconnectDevice") { it.disconnectDevice(macAddress) }
 
-    /** Release all Shizuku listeners and unbind the service. Call from Application.onTerminate or similar. */
+    /** Release all Shizuku listeners and helpers. Call from Application.onTerminate or similar. */
     fun cleanup() {
         stopMonitoring()
         Shizuku.removeBinderReceivedListener(binderReceivedListener)
         Shizuku.removeBinderDeadListener(binderDeadListener)
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
+        synchronized(this) { dropShellChannel() }
         doUnbindUserService()
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
     /**
-     * Routes an AIDL call through the shared service-access scaffold:
-     * waits for the UserService to bind (if needed), checks availability,
+     * Routes a call through the shared helper-access scaffold:
+     * waits for a helper to start (if needed), checks availability,
      * invokes [call] off the main thread, validates that at least one profile reported
      * success, and wraps any exception in a [Result.failure].
      *
-     * The binder call is synchronous and the UserService can block for several seconds while
-     * its profile proxies connect, so it always runs on [Dispatchers.IO] — callers on the main
-     * thread (the ViewModel) would otherwise freeze the UI.
+     * The call is synchronous and the helper can block for several seconds while its profile
+     * proxies connect, so it always runs on [Dispatchers.IO] — callers on the main thread (the
+     * ViewModel) would otherwise freeze the UI.
      *
-     * If the UserService process has died since we last bound it, the call is retried once
-     * after rebinding.
+     * If the helper has died since we last used it, the call is retried once on a new one.
      */
     private suspend fun callService(
         operationName: String,
         retryOnDeadService: Boolean = true,
-        call: (IBluetoothBouncerUserService) -> IntArray,
+        call: (PolicyChannel) -> IntArray,
     ): Result<IntArray> {
         awaitServiceIfNeeded()
-        val service = userService
-            ?: return Result.failure(IllegalStateException("Shizuku UserService is not available"))
+        val channel = activeChannel()
+            ?: return Result.failure(IllegalStateException("Bluetooth Bouncer's Shizuku helper is not available"))
         return try {
-            val results = withContext(Dispatchers.IO) { call(service) }
+            val results = withContext(Dispatchers.IO) { call(channel) }
             // Each entry: 1 = success, 0 = call returned false, -1 = proxy unavailable.
             // If no profile reported success the OS state was never changed — treat as failure.
             if (results.none { it == 1 }) {
@@ -385,34 +402,127 @@ class ShizukuHelper(private val context: Context) {
             } else {
                 Result.success(results)
             }
-        } catch (e: DeadObjectException) {
-            Log.w(TAG, "$operationName: UserService died — rebinding", e)
-            synchronized(this) {
-                if (userService === service) userService = null
-            }
-            refreshState()
-            if (retryOnDeadService) {
-                callService(operationName, retryOnDeadService = false, call)
-            } else {
-                Result.failure(e)
-            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "$operationName failed", e)
-            Result.failure(e)
+            if (e is DeadObjectException || e is ChannelDeadException) {
+                Log.w(TAG, "$operationName: ${channel.kind} died — reconnecting", e)
+                synchronized(this) {
+                    if (aidlChannel === channel) {
+                        aidlChannel = null
+                        bindRequested = false
+                        bindStartedAt = 0L
+                    }
+                    if (shellChannel === channel) dropShellChannel()
+                }
+                refreshState()
+                if (retryOnDeadService) {
+                    callService(operationName, retryOnDeadService = false, call)
+                } else {
+                    Result.failure(e)
+                }
+            } else {
+                Log.e(TAG, "$operationName failed via ${channel.kind}", e)
+                Result.failure(e)
+            }
         }
     }
 
-    /** Suspends until the UserService is ready, or gives up after [BIND_TIMEOUT_MS]. */
+    /** Suspends until a helper is ready, or gives up after [CONNECT_WAIT_MS]. */
     private suspend fun awaitServiceIfNeeded() {
-        if (userService == null && isShizukuRunning() && hasPermission()) {
+        if (activeChannel() == null && isShizukuRunning() && hasPermission()) {
             refreshState()
-            val ready = withTimeoutOrNull(BIND_TIMEOUT_MS) {
+            val ready = withTimeoutOrNull(CONNECT_WAIT_MS) {
                 _state.first { it is State.Ready }
             }
-            if (ready == null) Log.w(TAG, "Timed out waiting for UserService to bind")
+            if (ready == null) Log.w(TAG, "Timed out waiting for a privileged helper")
         }
+    }
+
+    /** The helper to use: the UserService if connected, else the shell helper, else null. */
+    private fun activeChannel(): PolicyChannel? {
+        aidlChannel?.let { if (it.isAlive()) return it }
+        shellChannel?.let { if (it.isAlive()) return it }
+        return null
+    }
+
+    /**
+     * Gets a helper starting, if one isn't already. Called with the lock held while Connecting.
+     *
+     * Order: the UserService (once per Shizuku session — never removed and re-requested, see
+     * [restartUserService]); if it hasn't connected after [USER_SERVICE_TIMEOUT_MS], or this
+     * phone already needed the shell helper before, the shell helper.
+     */
+    private fun ensureConnecting() {
+        if (shellChannel?.isAlive() == false) dropShellChannel()
+
+        if (preferShellHelper && !shellFailed) {
+            startShellHelper()
+            return
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        if (!bindRequested) {
+            bindRequested = true
+            bindStartedAt = now
+            bindUserService()
+            // Check back when the timeout passes, even if nothing else calls refreshState()
+            // (e.g. a broadcast receiver waiting in the background with no UI polling).
+            scope.launch {
+                delay(USER_SERVICE_TIMEOUT_MS + 250)
+                refreshState()
+            }
+            return
+        }
+        if (now - bindStartedAt >= USER_SERVICE_TIMEOUT_MS && !shellFailed) {
+            startShellHelper()
+        }
+    }
+
+    /** Starts the shell helper in the background, unless one is already starting. Lock held. */
+    private fun startShellHelper() {
+        if (shellStarting) return
+        shellStarting = true
+        Log.i(TAG, if (bindRequested) {
+            "UserService hasn't connected — starting the shell helper"
+        } else {
+            "Starting the shell helper (the UserService didn't work on this phone before)"
+        })
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching { ShellChannel.start(context) }
+            synchronized(this@ShizukuHelper) {
+                shellStarting = false
+                result.onSuccess { channel ->
+                    if (!isShizukuRunning()) {
+                        channel.destroy()
+                    } else {
+                        dropShellChannel()
+                        shellChannel = channel
+                        // The UserService didn't make it — skip straight to this next time.
+                        if (aidlChannel == null) preferShellHelper = true
+                        shellFailed = false
+                        lastShellError = null
+                        _bindProblem.value = null
+                        _state.value = State.Ready
+                    }
+                }.onFailure { e ->
+                    Log.e(TAG, "Shell helper failed to start", e)
+                    shellFailed = true
+                    lastShellError = e.message ?: e.toString()
+                    // Don't insist on a helper that doesn't work: next time try the UserService.
+                    preferShellHelper = false
+                    _bindProblem.value = "Shizuku couldn't start Bluetooth Bouncer's helper, " +
+                        "either as a background service or as a shell process. " +
+                        "Details: ${lastShellError}"
+                }
+            }
+            if (result.isFailure) refreshState() // falls back to the UserService if not tried yet
+        }
+    }
+
+    /** Lock held. */
+    private fun dropShellChannel() {
+        shellChannel?.destroy()
+        shellChannel = null
     }
 
     fun isShizukuInstalled(): Boolean {
@@ -443,35 +553,38 @@ class ShizukuHelper(private val context: Context) {
         .processNameSuffix("user_service")
         .version(BuildConfig.VERSION_CODE)
 
+    /** Lock held. On failure, goes straight to the shell helper. */
     private fun bindUserService() {
         try {
             Shizuku.bindUserService(buildUserServiceArgs(), serviceConnection)
         } catch (e: Exception) {
-            Log.e(TAG, "bindUserService failed", e)
-            _bindProblem.value = "Couldn't ask Shizuku to start Bluetooth Bouncer's background " +
-                "service: ${e.message ?: e.javaClass.simpleName}"
-            bindStartedAt = 0L
-        }
-    }
-
-    /** Removes our connection and Shizuku's record of the UserService (killing its process). */
-    private fun removeUserService() {
-        try {
-            Shizuku.unbindUserService(buildUserServiceArgs(), serviceConnection, true)
-        } catch (e: Exception) {
-            Log.w(TAG, "removeUserService failed", e)
+            Log.e(TAG, "bindUserService failed — using the shell helper", e)
+            bindStartedAt = 0L // counts as timed out
+            if (!shellFailed) startShellHelper()
         }
     }
 
     private fun doUnbindUserService() {
-        if (userService != null) {
+        if (aidlChannel != null) {
             try {
-                Shizuku.unbindUserService(buildUserServiceArgs(), serviceConnection, true)
+                // remove = false: removing a UserService can stop it from ever starting again
+                // until Shizuku restarts on some builds (thedjchi/Shizuku#201).
+                Shizuku.unbindUserService(buildUserServiceArgs(), serviceConnection, false)
             } catch (e: Exception) {
                 Log.w(TAG, "unbindUserService failed", e)
             }
-            userService = null
+            aidlChannel = null
         }
+    }
+
+    /** [PolicyChannel] over the Shizuku UserService's AIDL interface. */
+    private class AidlChannel(private val service: IBluetoothBouncerUserService) : PolicyChannel {
+        override val kind = "Shizuku UserService"
+        override fun isAlive(): Boolean = service.asBinder().isBinderAlive
+        override fun setConnectionPolicy(macAddress: String, policy: Int): IntArray =
+            service.setConnectionPolicy(macAddress, policy)
+        override fun connectDevice(macAddress: String): IntArray = service.connectDevice(macAddress)
+        override fun disconnectDevice(macAddress: String): IntArray = service.disconnectDevice(macAddress)
     }
 
     companion object {
@@ -479,15 +592,21 @@ class ShizukuHelper(private val context: Context) {
         private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
         private const val PERMISSION_REQUEST_CODE = 1001
 
-        /** Milliseconds to wait for the UserService to bind on cold start before giving up. */
-        private const val BIND_TIMEOUT_MS = 10_000L
+        /** How long to give the UserService before starting the shell helper instead. */
+        private const val USER_SERVICE_TIMEOUT_MS = 6_000L
 
-        /** How long a bind may take before it's treated as stuck and retried from scratch. */
-        private const val BIND_RETRY_MS = 12_000L
+        /**
+         * How long callers wait for any helper: the UserService timeout plus the shell helper's
+         * own startup (a cold `app_process` can take several seconds).
+         */
+        private const val CONNECT_WAIT_MS = 30_000L
+
+        private const val PREFS_NAME = "shizuku"
+        private const val KEY_PREFER_SHELL_HELPER = "prefer_shell_helper"
 
         /** Log lines containing any of these make it into [collectDiagnostics]. */
         private val LOG_KEYWORDS = listOf(
-            "bluetoothbouncer", "BBUserService", "ShizukuHelper", "PolicyEnforcer",
+            "bluetoothbouncer", "BBUserService", "BBShell", "ShizukuHelper", "PolicyEnforcer",
             "Shizuku", "UserService", "user_service", "AndroidRuntime", "FATAL",
         )
         private const val MAX_DIAGNOSTIC_LOG_LINES = 300
