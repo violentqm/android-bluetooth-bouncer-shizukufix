@@ -255,10 +255,10 @@ class PolicyEnforcer(
     /**
      * Blocks any newly paired device that the auto-blocker hasn't seen before.
      *
-     * A device is blocked only when it is new (not in the baseline and not already in the block
-     * list) **and not currently connected** — a device the user is actively using is left alone,
-     * as requested. Either way it joins the baseline so it's never auto-blocked again; the user
-     * can still block or unblock it by hand afterwards.
+     * A device is blocked as soon as it's new — not in the baseline (the devices paired when the
+     * feature was turned on) and not already in the block list — even if pairing has already
+     * connected it; blocking drops that connection. Once decided it joins the baseline so it's
+     * never auto-blocked again, and the user can block or unblock it by hand afterwards.
      *
      * No-op unless the feature is on, Shizuku is ready and Bluetooth is on.
      */
@@ -288,13 +288,6 @@ class PolicyEnforcer(
             val mac = device.address
             if (mac in known) continue
             if (mac in alreadyBlocked) {
-                settings.markKnown(listOf(mac))
-                continue
-            }
-            if (isAclConnected(mac) != false) {
-                // Currently connected (or state unknown) — leave it alone, but remember it so a
-                // later disconnect doesn't make it look new.
-                Log.d(TAG, "autoBlock($reason): $mac is connected — leaving it allowed")
                 settings.markKnown(listOf(mac))
                 continue
             }

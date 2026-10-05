@@ -274,8 +274,8 @@ private fun AutoBlockRow(
                 fontWeight = FontWeight.Medium,
             )
             Text(
-                text = "Block any device paired from now on. Devices already paired, and any " +
-                    "device connected at the time, are left alone.",
+                text = "Block any device paired from now on, the moment it's detected. " +
+                    "Devices already paired when you turn this on are left alone.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
