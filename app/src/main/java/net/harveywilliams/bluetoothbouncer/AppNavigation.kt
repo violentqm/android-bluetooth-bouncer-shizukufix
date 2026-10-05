@@ -35,6 +35,7 @@ fun AppNavigation(
             shizukuHelper = app.shizukuHelper,
             blockedDeviceDao = app.database.blockedDeviceDao(),
             policyEnforcer = app.policyEnforcer,
+            appSettings = app.appSettings,
         )
     )
     val uiState by viewModel.uiState.collectAsState()
@@ -58,6 +59,7 @@ fun AppNavigation(
                 onNavigateToSetup = { navController.navigate(Routes.SHIZUKU_SETUP) },
                 onClearToggleError = viewModel::clearToggleError,
                 onRefresh = viewModel::refreshDevices,
+                onSetAutoBlockNewDevices = viewModel::setAutoBlockNewDevices,
             )
         }
 

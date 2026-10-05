@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import net.harveywilliams.bluetoothbouncer.data.AppDatabase
+import net.harveywilliams.bluetoothbouncer.data.AppSettings
 import net.harveywilliams.bluetoothbouncer.notification.WatchNotificationHelper
 import net.harveywilliams.bluetoothbouncer.service.NearbyDeviceTracker
 import net.harveywilliams.bluetoothbouncer.service.PolicyEnforcer
@@ -34,6 +35,9 @@ class BluetoothBouncerApp : Application() {
     val database: AppDatabase by lazy { AppDatabase.getDatabase(this) }
 
     val shizukuHelper: ShizukuHelper by lazy { ShizukuHelper(this) }
+
+    /** Persisted user settings (e.g. auto-block new devices). */
+    val appSettings: AppSettings by lazy { AppSettings(this) }
 
     /**
      * App-level event bus for Bluetooth state changes (ACL connect/disconnect, bond state,
@@ -66,7 +70,7 @@ class BluetoothBouncerApp : Application() {
      * drifts from Room. See [PolicyEnforcer].
      */
     val policyEnforcer: PolicyEnforcer by lazy {
-        PolicyEnforcer(this, database.blockedDeviceDao(), shizukuHelper, nearbyTracker, applicationScope)
+        PolicyEnforcer(this, database.blockedDeviceDao(), shizukuHelper, nearbyTracker, appSettings, applicationScope)
     }
 
     override fun onCreate() {
@@ -138,7 +142,11 @@ class BluetoothBouncerApp : Application() {
                 .map { it is ShizukuHelper.State.Ready }
                 .distinctUntilChanged()
                 .filter { it }
-                .collect { policyEnforcer.reconcile("Shizuku ready") }
+                .collect {
+                    policyEnforcer.reconcile("Shizuku ready")
+                    // Catch devices paired while Shizuku was unavailable.
+                    policyEnforcer.autoBlockNewDevices("Shizuku ready")
+                }
         }
     }
 
@@ -156,6 +164,7 @@ class BluetoothBouncerApp : Application() {
                     // UserService's proxies are usable.
                     delay(BLUETOOTH_ON_SETTLE_MS)
                     policyEnforcer.reconcile("Bluetooth on", force = true)
+                    policyEnforcer.autoBlockNewDevices("Bluetooth on")
                 }
             }
         }

@@ -75,6 +75,7 @@ fun DeviceListScreen(
     onNavigateToSetup: () -> Unit,
     onClearToggleError: () -> Unit,
     onRefresh: () -> Unit,
+    onSetAutoBlockNewDevices: (Boolean) -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
@@ -205,6 +206,16 @@ fun DeviceListScreen(
 
             HorizontalDivider()
 
+            // ── Auto-block new devices toggle ────────────────────────────────
+            if (uiState.btPermissionGranted && uiState.bluetoothEnabled) {
+                AutoBlockRow(
+                    enabled = uiState.autoBlockNewDevices,
+                    shizukuReady = uiState.shizukuState is ShizukuHelper.State.Ready,
+                    onToggle = onSetAutoBlockNewDevices,
+                )
+                HorizontalDivider()
+            }
+
             // ── Main content ─────────────────────────────────────────────────
             when {
                 uiState.isLoading -> {
@@ -238,6 +249,43 @@ fun DeviceListScreen(
                 }
             }
         }
+    }
+}
+
+// ── Auto-block new devices ──────────────────────────────────────────────────────
+
+@Composable
+private fun AutoBlockRow(
+    enabled: Boolean,
+    shizukuReady: Boolean,
+    onToggle: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "Auto-block new devices",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "Block any device paired from now on. Devices already paired, and any " +
+                    "device connected at the time, are left alone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.size(12.dp))
+        Switch(
+            checked = enabled,
+            onCheckedChange = onToggle,
+            enabled = shizukuReady,
+        )
     }
 }
 

@@ -31,7 +31,9 @@ class BondStateReceiver : BroadcastReceiver() {
         launchAsync(context) { app ->
             val blocked = app.database.blockedDeviceDao().getDeviceByMac(device.address)
             if (blocked == null) {
-                Log.d(TAG, "Device ${device.address} not in blocked list — nothing to do")
+                Log.d(TAG, "Device ${device.address} not in blocked list")
+                // A freshly paired device — auto-block it if the user turned that on.
+                app.policyEnforcer.autoBlockNewDevices("bonded ${device.address}")
                 // Emit so the ViewModel picks up the newly bonded device in the list.
                 app.refreshSignal.tryEmit(Unit)
                 return@launchAsync

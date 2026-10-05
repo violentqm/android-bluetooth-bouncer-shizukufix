@@ -14,7 +14,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import net.harveywilliams.bluetoothbouncer.data.AppSettings
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceDao
+import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceEntity
 import net.harveywilliams.bluetoothbouncer.shizuku.ShizukuHelper
 import net.harveywilliams.bluetoothbouncer.util.BluetoothAclHelper
 import java.util.concurrent.ConcurrentHashMap
@@ -42,6 +44,7 @@ class PolicyEnforcer(
     private val dao: BlockedDeviceDao,
     private val shizukuHelper: ShizukuHelper,
     private val nearbyTracker: NearbyDeviceTracker,
+    private val settings: AppSettings,
     private val scope: CoroutineScope,
 ) {
     private val mutex = Mutex()
@@ -228,6 +231,102 @@ class PolicyEnforcer(
             }
             lastReconcileAt = SystemClock.elapsedRealtime()
         }
+    }
+
+    // ── Auto-block new devices ──────────────────────────────────────────────
+
+    /**
+     * Turns the "auto-block new devices" feature on or off.
+     *
+     * On enable, every device currently paired becomes part of the baseline, so nothing already
+     * on the phone is blocked — only devices paired *after* this point are. On disable, the
+     * baseline is left as-is so toggling back on doesn't re-block the whole list.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun setAutoBlockNewDevices(enabled: Boolean) {
+        settings.setAutoBlockNewDevices(enabled)
+        if (enabled) {
+            settings.seedKnown(bondedAddresses() ?: emptySet())
+            Log.d(TAG, "Auto-block enabled — baseline is ${settings.knownDevices().size} paired device(s)")
+            autoBlockNewDevices("just enabled")
+        }
+    }
+
+    /**
+     * Blocks any newly paired device that the auto-blocker hasn't seen before.
+     *
+     * A device is blocked only when it is new (not in the baseline and not already in the block
+     * list) **and not currently connected** — a device the user is actively using is left alone,
+     * as requested. Either way it joins the baseline so it's never auto-blocked again; the user
+     * can still block or unblock it by hand afterwards.
+     *
+     * No-op unless the feature is on, Shizuku is ready and Bluetooth is on.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun autoBlockNewDevices(reason: String) {
+        if (!settings.autoBlockNewDevices.value) return
+        if (shizukuHelper.state.value !is ShizukuHelper.State.Ready) {
+            Log.d(TAG, "autoBlock($reason): Shizuku not ready — skipping")
+            return
+        }
+        val adapter = bluetoothAdapter()
+        if (adapter == null || !adapter.isEnabled) {
+            Log.d(TAG, "autoBlock($reason): Bluetooth off — skipping")
+            return
+        }
+        val bonded = try {
+            adapter.bondedDevices.orEmpty()
+        } catch (e: SecurityException) {
+            Log.w(TAG, "autoBlock($reason): no BLUETOOTH_CONNECT — skipping", e)
+            return
+        }
+
+        val known = settings.knownDevices()
+        val alreadyBlocked = dao.getAllDevices().first().map { it.macAddress }.toSet()
+        // Not under the policy lock: reading state doesn't need it, and blockDevice() locks itself.
+        for (device in bonded) {
+            val mac = device.address
+            if (mac in known) continue
+            if (mac in alreadyBlocked) {
+                settings.markKnown(listOf(mac))
+                continue
+            }
+            if (isAclConnected(mac) != false) {
+                // Currently connected (or state unknown) — leave it alone, but remember it so a
+                // later disconnect doesn't make it look new.
+                Log.d(TAG, "autoBlock($reason): $mac is connected — leaving it allowed")
+                settings.markKnown(listOf(mac))
+                continue
+            }
+            val name = device.alias ?: device.name ?: mac
+            Log.i(TAG, "autoBlock($reason): blocking new device $name ($mac)")
+            val result = blockDevice(mac, name)
+            // Mark known on success only — a failed block (e.g. Shizuku dropped mid-scan) should
+            // be retried next time rather than silently left allowed forever.
+            if (result.isSuccess) settings.markKnown(listOf(mac))
+            else Log.w(TAG, "autoBlock($reason): failed to block $mac — will retry: ${result.exceptionOrNull()?.message}")
+        }
+    }
+
+    /**
+     * Blocks a device: applies CONNECTION_POLICY_FORBIDDEN and, on success, adds it to the block
+     * list (a no-op insert if it's already there). Runs under the policy lock.
+     */
+    suspend fun blockDevice(macAddress: String, deviceName: String): Result<IntArray> =
+        withPolicyLock {
+            shizukuHelper.setConnectionPolicy(macAddress, ShizukuHelper.POLICY_FORBIDDEN).also {
+                if (it.isSuccess && dao.getDeviceByMac(macAddress) == null) {
+                    dao.insertDevice(BlockedDeviceEntity(macAddress = macAddress, deviceName = deviceName))
+                }
+            }
+        }
+
+    /** Paired-device MACs, or null if they can't be read (no BLUETOOTH_CONNECT / adapter). */
+    @SuppressLint("MissingPermission")
+    private fun bondedAddresses(): Set<String>? = try {
+        bluetoothAdapter()?.bondedDevices?.map { it.address }?.toSet()
+    } catch (e: SecurityException) {
+        null
     }
 
     private fun isTemporaryAllowStale(macAddress: String): Boolean {

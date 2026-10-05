@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import net.harveywilliams.bluetoothbouncer.BluetoothBouncerApp
+import net.harveywilliams.bluetoothbouncer.data.AppSettings
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceDao
 import net.harveywilliams.bluetoothbouncer.data.BlockedDeviceEntity
 import net.harveywilliams.bluetoothbouncer.service.DeviceWatchManager
@@ -49,6 +50,7 @@ class DeviceListViewModel(
     private val shizukuHelper: ShizukuHelper,
     private val blockedDeviceDao: BlockedDeviceDao,
     private val policyEnforcer: PolicyEnforcer,
+    private val appSettings: AppSettings,
 ) : AndroidViewModel(application) {
 
     // ── UI model ─────────────────────────────────────────────────────────────
@@ -96,6 +98,8 @@ class DeviceListViewModel(
         val disconnectLoadingAddress: String? = null,
         /** MAC addresses whose Block/Allow toggle is in-flight. Their switches are disabled. */
         val toggleLoadingAddresses: Set<String> = emptySet(),
+        /** Whether newly paired devices are blocked automatically. */
+        val autoBlockNewDevices: Boolean = false,
     )
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -187,6 +191,13 @@ class DeviceListViewModel(
                 if (currentPermission) {
                     refreshDeviceList(blockedDevices)
                 }
+            }
+        }
+
+        // Mirror the auto-block setting into the UI state.
+        viewModelScope.launch {
+            appSettings.autoBlockNewDevices.collect { enabled ->
+                _uiState.update { it.copy(autoBlockNewDevices = enabled) }
             }
         }
 
@@ -521,6 +532,16 @@ class DeviceListViewModel(
         }
     }
 
+    /**
+     * Turns "auto-block new devices" on or off. Enabling seeds the baseline from the devices
+     * paired now (so none of them is blocked) and blocks anything paired afterwards.
+     */
+    fun setAutoBlockNewDevices(enabled: Boolean) {
+        viewModelScope.launch {
+            policyEnforcer.setAutoBlockNewDevices(enabled)
+        }
+    }
+
     fun clearToggleError() {
         _uiState.update { it.copy(toggleError = null) }
     }
@@ -808,10 +829,11 @@ class DeviceListViewModel(
             shizukuHelper: ShizukuHelper,
             blockedDeviceDao: BlockedDeviceDao,
             policyEnforcer: PolicyEnforcer,
+            appSettings: AppSettings,
         ): ViewModelProvider.Factory = viewModelFactory {
             initializer {
                 val app = checkNotNull(this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY])
-                DeviceListViewModel(app, shizukuHelper, blockedDeviceDao, policyEnforcer)
+                DeviceListViewModel(app, shizukuHelper, blockedDeviceDao, policyEnforcer, appSettings)
             }
         }
     }
